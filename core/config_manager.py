@@ -1,6 +1,7 @@
 import json
 import os
-import sys
+
+from core import get_app_dir
 
 
 _CONFIG = {
@@ -25,14 +26,7 @@ _CONFIG = {
     },
 }
 
-
-def _app_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-_CONFIG_PATH = os.path.join(_app_dir(), "config.json")
+_CONFIG_PATH = os.path.join(get_app_dir(), "config.json")
 
 
 class ConfigManager:

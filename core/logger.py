@@ -3,15 +3,10 @@ import sys
 import logging
 from logging.handlers import RotatingFileHandler
 
-
-def _app_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from core import get_app_dir
 
 
-_LOG_DIR = _app_dir()
-_LOG_FILE = os.path.join(_LOG_DIR, "mytoolbox.log")
+_LOG_FILE = os.path.join(get_app_dir(), "mytoolbox.log")
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 _LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"

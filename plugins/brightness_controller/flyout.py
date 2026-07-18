@@ -10,7 +10,8 @@ from PIL import Image
 import pystray
 
 from plugins.brightness_controller.ddcci import (
-    enumerate_monitors, get_brightness, set_brightness, cleanup,
+    enumerate_monitors, get_brightness, set_brightness, set_brightness_async,
+    cleanup, enumerate_monitors_async,
 )
 
 
@@ -191,7 +192,8 @@ class _Slider:
 class FlyoutWindow:
     """Manages the brightness flyout popup window. Must be used on the tkinter main thread."""
 
-    def __init__(self, tk_root, icon_path):
+    def __init__(self, app, tk_root, icon_path):
+        self.app = app
         self._root = tk_root
         self._icon_path = icon_path
         self._accent = get_accent_color()
@@ -201,10 +203,6 @@ class FlyoutWindow:
         self._timer = None
         self._prev_mouse = False
         self._lock = threading.Lock()
-
-    def _refresh_monitors(self):
-        cleanup(self._monitors)
-        self._monitors = enumerate_monitors()
 
     def show(self):
         with self._lock:
@@ -217,7 +215,15 @@ class FlyoutWindow:
             self._schedule()
             return
 
-        self._refresh_monitors()
+        cleanup(self._monitors)
+        self._monitors = []
+        self._win = None
+
+        enumerate_monitors_async(lambda monitors:
+            self.app.schedule_ui(lambda: self._build_ui(monitors)))
+
+    def _build_ui(self, monitors):
+        self._monitors = monitors
         if not self._monitors:
             return
 
@@ -252,7 +258,7 @@ class FlyoutWindow:
             s._redraw()
         self._win.focus_force()
         self._schedule()
-        self._prev_mouse = False
+        self._prev_mouse = bool(ctypes.windll.user32.GetAsyncKeyState(1) & 0x8000)
         self._win.after(100, self._check_outside)
 
     def _build_row(self, parent, mon, idx):
@@ -291,7 +297,7 @@ class FlyoutWindow:
 
         sl = _Slider(row, SLIDER_W, ROW_H, cur,
                       lambda v, m=mon, p=pv: (
-                          p.set(f"{int(v)}"), self._schedule(), set_brightness(m, int(v))
+                          p.set(f"{int(v)}"), self._schedule(), set_brightness_async(m, int(v))
                       ),
                       accent=self._accent)
         sl.widget.pack(side=tk.RIGHT, padx=(4, 2))
@@ -340,14 +346,15 @@ class FlyoutWindow:
             self._timer = None
 
     def _close(self):
-        self._cancel()
-        if self._win:
-            try:
-                self._win.destroy()
-            except Exception:
-                pass
-            self._win = None
-            self._sliders = []
+        with self._lock:
+            self._cancel()
+            if self._win:
+                try:
+                    self._win.destroy()
+                except Exception:
+                    pass
+                self._win = None
+                self._sliders = []
 
     def close(self):
         self._close()

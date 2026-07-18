@@ -5,16 +5,13 @@ import threading
 import pystray
 from PIL import Image
 
+from core import is_frozen
 from plugins.base import Plugin
 from core.logger import get_logger
 
 
-def _is_frozen():
-    return getattr(sys, "frozen", False)
-
-
 def _get_icon_path():
-    if _is_frozen():
+    if is_frozen():
         return os.path.join(sys._MEIPASS, "plugins", "brightness_controller", "assets", "fluent.ico")
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fluent.ico")
 
@@ -43,7 +40,7 @@ class BrightnessPlugin(Plugin):
     def on_start(self):
         from plugins.brightness_controller.flyout import FlyoutWindow, create_tray_icon
 
-        self._flyout = FlyoutWindow(self.app.tk_root, self._icon_path)
+        self._flyout = FlyoutWindow(self.app, self.app.tk_root, self._icon_path)
 
         def on_activate(*args):
             self.app.schedule_ui(self._flyout.show)

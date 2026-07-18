@@ -3,6 +3,7 @@ import sys
 import threading
 import queue
 
+from core import is_frozen
 from core.logger import setup_logger, get_logger
 from core.config_manager import ConfigManager
 from core.plugin_manager import PluginManager
@@ -10,18 +11,8 @@ from core.tray_manager import TrayManager
 from core.ipc_server import IpcServer
 
 
-def _is_frozen():
-    return getattr(sys, "frozen", False)
-
-
 def _get_exe_path():
     return sys.executable
-
-
-def _resource_path(relative):
-    if _is_frozen():
-        return os.path.join(sys._MEIPASS, relative)
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), relative)
 
 
 class MyToolBoxApp:
@@ -156,7 +147,7 @@ class MyToolBoxApp:
     def _start_helper_plugin(self, name, plugin):
         self.ipc.listen(name)
         exe = _get_exe_path()
-        if _is_frozen():
+        if is_frozen():
             args = f'--helper {name} --core-pid {os.getpid()}'
         else:
             script = os.path.abspath(sys.argv[0])
@@ -203,19 +194,23 @@ class MyToolBoxApp:
             return False
 
     def on_toggle_autostart(self):
-        import win32com.client
-        shell = win32com.client.Dispatch("WScript.Shell")
-        startup = shell.SpecialFolders("Startup")
-        lnk_path = os.path.join(startup, "MyToolBox.lnk")
-        if os.path.exists(lnk_path):
-            os.remove(lnk_path)
-            self._autostart_enabled = False
-        else:
-            shortcut = shell.CreateShortCut(lnk_path)
-            shortcut.TargetPath = _get_exe_path()
-            shortcut.WorkingDirectory = os.path.dirname(_get_exe_path())
-            shortcut.Save()
-            self._autostart_enabled = True
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch("WScript.Shell")
+            startup = shell.SpecialFolders("Startup")
+            lnk_path = os.path.join(startup, "MyToolBox.lnk")
+            if os.path.exists(lnk_path):
+                os.remove(lnk_path)
+                self._autostart_enabled = False
+            else:
+                shortcut = shell.CreateShortCut(lnk_path)
+                shortcut.TargetPath = _get_exe_path()
+                shortcut.WorkingDirectory = os.path.dirname(_get_exe_path())
+                shortcut.Save()
+                self._autostart_enabled = True
+        except Exception as e:
+            if self._log:
+                self._log.error(f"切换开机自启失败: {e}")
         self._update_menu()
 
     def on_exit(self):

@@ -14,10 +14,6 @@ kernel32.CreateMutexW.restype = wintypes.HANDLE
 ERROR_ALREADY_EXISTS = 183
 
 
-def _is_frozen():
-    return getattr(sys, "frozen", False)
-
-
 def _ensure_single_instance():
     global _mutex_handle
     _mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)

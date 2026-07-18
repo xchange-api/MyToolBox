@@ -63,6 +63,10 @@ class IpcClient:
                                 self._reader_callback(msg)
                             except json.JSONDecodeError:
                                 pass
+                elif hr == 234:
+                    if data:
+                        buf += data
+                    continue
                 else:
                     break
             except pywintypes.error:

@@ -7,6 +7,8 @@ import pywintypes
 import win32pipe
 import win32file
 import win32event
+import win32security
+import win32api
 
 from core.logger import get_logger
 
@@ -23,6 +25,24 @@ def make_pipe_name(plugin_name, core_pid=None):
     return f"{PIPE_PREFIX}\\{plugin_name}_{pid}"
 
 
+def _create_pipe_security():
+    sd = win32security.SECURITY_ATTRIBUTES()
+    sd.bInheritHandle = False
+    user_sid = win32security.GetTokenInformation(
+        win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32security.TOKEN_QUERY),
+        win32security.TokenUser,
+    )[0]
+    acl = win32security.ACL()
+    acl.AddAccessAllowedAce(
+        win32security.ACL_REVISION,
+        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+        user_sid,
+    )
+    sd.SetSecurityDescriptorDacl(1, acl, 0)
+    return sd
+
+
 class IpcServer:
     def __init__(self):
         self._log = get_logger()
@@ -31,6 +51,7 @@ class IpcServer:
         self._running = False
 
     def listen(self, plugin_name):
+        self._cleanup_pipe(plugin_name)
         pipe_name = make_pipe_name(plugin_name)
         self._log.info(f"IPC 监听: {pipe_name}")
         t = threading.Thread(target=self._listen_loop, args=(plugin_name, pipe_name), daemon=True)
@@ -40,11 +61,12 @@ class IpcServer:
     def _listen_loop(self, plugin_name, pipe_name):
         self._running = True
         try:
+            sa = _create_pipe_security()
             handle = win32pipe.CreateNamedPipe(
                 pipe_name,
                 win32pipe.PIPE_ACCESS_DUPLEX,
                 win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-                1, PIPE_BUFFER, PIPE_BUFFER, 0, None,
+                1, PIPE_BUFFER, PIPE_BUFFER, 0, sa,
             )
             self._pipes[plugin_name] = handle
 
@@ -74,7 +96,11 @@ class IpcServer:
                         line = line.strip()
                         if line:
                             self._on_message(plugin_name, line)
-                elif hr != 0:
+                elif hr == 234:
+                    if data:
+                        buf += data
+                    continue
+                else:
                     break
             except pywintypes.error:
                 break

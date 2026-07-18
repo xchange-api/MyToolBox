@@ -5,6 +5,7 @@ DDC/CI 显示器亮度控制模块
 """
 
 import ctypes
+import threading
 from ctypes import wintypes, Structure, POINTER, byref
 
 
@@ -98,7 +99,9 @@ _enum_list = []
 
 def _enum_proc(hmonitor, hdc, rect, lparam):
     """EnumDisplayMonitors 回调：收集所有显示器 HMONITOR"""
-    _enum_list.append(hmonitor)
+    lst = getattr(_thread_local, 'enum_list', None)
+    if lst is not None:
+        lst.append(hmonitor)
     return True
 
 
@@ -113,14 +116,15 @@ _EnumDisplayMonitors.restype = wintypes.BOOL
 
 _enum_callback = _MonitorEnumProc(_enum_proc)
 
+_thread_local = threading.local()
+
 
 def _get_monitor_handles():
     """获取所有显示器的 HMONITOR 句柄列表"""
-    global _enum_list
-    _enum_list = []
+    _thread_local.enum_list = []
     if not _EnumDisplayMonitors(None, None, _enum_callback, 0):
         raise ctypes.WinError()
-    return list(_enum_list)
+    return list(_thread_local.enum_list)
 
 
 def enumerate_monitors():
@@ -191,3 +195,16 @@ def cleanup(monitors):
     for m in monitors:
         destroy(m)
     monitors.clear()
+
+
+def enumerate_monitors_async(callback):
+    """在后台线程枚举显示器，完成后在主线程执行 callback(monitors)"""
+    def _worker():
+        result = enumerate_monitors()
+        callback(result)
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def set_brightness_async(monitor, value):
+    """在后台线程设置显示器亮度"""
+    threading.Thread(target=set_brightness, args=(monitor, value), daemon=True).start()

@@ -1,4 +1,5 @@
 import ctypes
+import os
 import queue
 import threading
 import unicodedata
@@ -64,9 +65,10 @@ class PopupWindow:
         )
 
         font = ImageFont.load_default()
+        fonts_dir = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Fonts")
         for name in [
-            "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyhbd.ttc",
-            "C:/Windows/Fonts/segoeui.ttf", "msyh.ttc", "segoeui.ttf",
+            os.path.join(fonts_dir, "msyh.ttc"), os.path.join(fonts_dir, "msyhbd.ttc"),
+            os.path.join(fonts_dir, "segoeui.ttf"), "msyh.ttc", "segoeui.ttf",
         ]:
             try:
                 font = ImageFont.truetype(name, font_size)
@@ -195,10 +197,13 @@ class PopupWindow:
 
         user32.SetTimer(hwnd, 100, 50, None)
 
-        msg = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0):
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-
-        gdi32.DeleteObject(self._hbmp)
-        gdi32.DeleteDC(self._hdc_mem)
+        try:
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            if hasattr(self, '_hbmp') and self._hbmp:
+                gdi32.DeleteObject(self._hbmp)
+            if hasattr(self, '_hdc_mem') and self._hdc_mem:
+                gdi32.DeleteDC(self._hdc_mem)
