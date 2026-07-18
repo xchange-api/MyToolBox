@@ -1,0 +1,50 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=[
+        'core', 'core.app', 'core.config_manager', 'core.logger',
+        'core.plugin_manager', 'core.tray_manager',
+        'core.ipc_server', 'core.ipc_client',
+        'plugins', 'plugins.base',
+        'plugins.input_state_notifier',
+        'plugins.input_state_notifier.plugin',
+        'plugins.input_state_notifier.notifier',
+        'plugins.input_state_notifier.popup',
+        'plugins.sguard_limiter',
+        'plugins.sguard_limiter.plugin',
+        'plugins.sguard_limiter.plugin_helper',
+        'plugins.sguard_limiter.limiter',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='MyToolBox',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
