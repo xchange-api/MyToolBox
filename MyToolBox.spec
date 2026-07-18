@@ -4,7 +4,9 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('plugins/brightness_controller/assets/fluent.ico', 'plugins/brightness_controller/assets'),
+    ],
     hiddenimports=[
         'core', 'core.app', 'core.config_manager', 'core.logger',
         'core.plugin_manager', 'core.tray_manager',
@@ -18,6 +20,10 @@ a = Analysis(
         'plugins.sguard_limiter.plugin',
         'plugins.sguard_limiter.plugin_helper',
         'plugins.sguard_limiter.limiter',
+        'plugins.brightness_controller',
+        'plugins.brightness_controller.plugin',
+        'plugins.brightness_controller.flyout',
+        'plugins.brightness_controller.ddcci',
     ],
     hookspath=[],
     hooksconfig={},

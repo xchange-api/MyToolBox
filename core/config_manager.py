@@ -19,6 +19,9 @@ _CONFIG = {
             "enabled": False,
             "interval": 1.0,
         },
+        "brightness_controller": {
+            "enabled": True,
+        },
     },
 }
 

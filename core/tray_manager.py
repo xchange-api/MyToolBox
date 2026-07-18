@@ -54,44 +54,14 @@ class TrayManager:
     def _build_menu(self):
         items = []
 
-        categories = {}
         for name, plugin in self._app.plugins.items():
-            cat = plugin.category or "其他"
-            categories.setdefault(cat, []).append((name, plugin))
-
-        first = True
-        for cat_label in ["系统工具", "性能工具", "其他"]:
-            if cat_label not in categories:
-                continue
-            cat_plugins = categories[cat_label]
-            if not first:
-                items.append(pystray.Menu.SEPARATOR)
-            first = False
-
-            sub_items = []
-            for name, plugin in cat_plugins:
-                sub_items.append(
-                    pystray.MenuItem(
-                        plugin.display_name,
-                        lambda *_, n=name: self._on_toggle(n),
-                        checked=lambda item, n=name: self._is_active(n),
-                    )
+            items.append(
+                pystray.MenuItem(
+                    plugin.display_name,
+                    lambda *_, n=name: self._on_toggle(n),
+                    checked=lambda item, n=name: self._is_active(n),
                 )
-                if name in self._app.active_helper_plugins:
-                    status = self._app.helper_statuses.get(name, {})
-                    if status.get("running"):
-                        sub_items.append(
-                            pystray.MenuItem(
-                                f"状态: 运行中",
-                                None,
-                                enabled=False,
-                            )
-                        )
-
-            if len(sub_items) == 1:
-                items.append(sub_items[0])
-            else:
-                items.append(pystray.MenuItem(cat_label, pystray.Menu(*sub_items)))
+            )
 
         items.append(pystray.Menu.SEPARATOR)
         items.append(
