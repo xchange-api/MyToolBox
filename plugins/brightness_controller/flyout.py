@@ -309,6 +309,40 @@ class FlyoutWindow:
         sl.widget.pack(side=tk.RIGHT, padx=(4, 2))
         self._sliders.append(sl)
 
+    def brightness_up(self):
+        self._adjust_brightness(10)
+
+    def brightness_down(self):
+        self._adjust_brightness(-10)
+
+    def _adjust_brightness(self, delta):
+        monitors = list(self._monitors) if self._monitors else None
+        if not monitors:
+            enumerate_monitors_async(lambda mons: self._do_adjust(mons, delta))
+        else:
+            self._do_adjust(monitors, delta)
+
+    def _do_adjust(self, monitors, delta):
+        def _worker():
+            new_vals = []
+            for mon in monitors:
+                try:
+                    cur = get_brightness(mon)
+                    new = max(0, min(100, cur + delta))
+                    set_brightness_async(mon, new)
+                    new_vals.append(new)
+                except Exception:
+                    new_vals.append(None)
+            if self._win and self._win.winfo_exists():
+                self.app.schedule_ui(lambda: self._update_sliders(new_vals))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_sliders(self, vals):
+        for i, sl in enumerate(self._sliders):
+            if i < len(vals) and vals[i] is not None:
+                sl._val = vals[i]
+                sl._redraw()
+
     def _position(self, w, h):
         pos, work = get_taskbar_info()
         wl, wt, wr, wb = work
