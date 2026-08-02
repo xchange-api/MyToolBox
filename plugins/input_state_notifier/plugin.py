@@ -33,5 +33,4 @@ class InputStateNotifierPlugin(Plugin):
         pass
 
     def get_menu_items(self):
-        from plugins.base import TrayMenuItem
         return []

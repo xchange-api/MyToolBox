@@ -3,7 +3,6 @@ import os
 
 from core import get_app_dir
 
-
 _CONFIG = {
     "general": {
         "autostart": False,

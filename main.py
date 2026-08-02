@@ -1,8 +1,7 @@
+import ctypes
 import os
 import sys
-import ctypes
 from ctypes import wintypes
-
 
 MUTEX_NAME = "MyToolBox_SingleInstance"
 _mutex_handle = None

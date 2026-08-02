@@ -1,4 +1,4 @@
-from plugins.base import Plugin, TrayMenuItem
+from plugins.base import Plugin
 
 
 class SGuardLimiterPlugin(Plugin):

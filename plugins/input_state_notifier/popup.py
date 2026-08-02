@@ -2,9 +2,9 @@ import ctypes
 import os
 import queue
 import threading
-import unicodedata
 from ctypes import wintypes
 
+import unicodedata
 import win32api
 import win32con
 import win32gui

@@ -1,19 +1,16 @@
-import math
-import os
-import sys
 import ctypes
-from ctypes import wintypes
-import winreg
+import math
 import threading
+import winreg
+from ctypes import wintypes
 
-from PIL import Image
 import pystray
+from PIL import Image
 
 from plugins.brightness_controller.ddcci import (
-    enumerate_monitors, get_brightness, set_brightness, set_brightness_async,
+    get_brightness, set_brightness_async,
     cleanup, enumerate_monitors_async,
 )
-
 
 BG = "#3C3C3C"
 FG = "#ffffff"
@@ -228,7 +225,6 @@ class FlyoutWindow:
             return
 
         import tkinter as tk
-        from PIL import ImageTk
 
         self._win = tk.Toplevel(self._root)
         self._win.overrideredirect(True)

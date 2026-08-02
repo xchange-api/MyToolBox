@@ -1,17 +1,14 @@
 import json
 import os
 import threading
-import time
 
 import pywintypes
-import win32pipe
-import win32file
-import win32event
-import win32security
 import win32api
+import win32file
+import win32pipe
+import win32security
 
 from core.logger import get_logger
-
 
 PIPE_PREFIX = r"\\.\pipe\MyToolBox"
 HEARTBEAT_TIMEOUT = 15.0

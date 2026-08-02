@@ -4,8 +4,8 @@ import threading
 import time
 
 import pywintypes
-import win32pipe
 import win32file
+import win32pipe
 
 from core.logger import get_logger
 

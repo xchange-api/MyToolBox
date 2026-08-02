@@ -1,14 +1,14 @@
 import os
+import queue
 import sys
 import threading
-import queue
 
 from core import is_frozen
-from core.logger import setup_logger, get_logger
 from core.config_manager import ConfigManager
+from core.ipc_server import IpcServer
+from core.logger import setup_logger, get_logger
 from core.plugin_manager import PluginManager
 from core.tray_manager import TrayManager
-from core.ipc_server import IpcServer
 
 
 def _get_exe_path():

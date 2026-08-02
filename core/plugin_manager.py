@@ -1,6 +1,5 @@
 import importlib
 import pkgutil
-import sys
 
 from core.logger import get_logger
 

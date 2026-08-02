@@ -1,10 +1,9 @@
+import logging
 import os
 import sys
-import logging
 from logging.handlers import RotatingFileHandler
 
 from core import get_app_dir
-
 
 _LOG_FILE = os.path.join(get_app_dir(), "mytoolbox.log")
 
