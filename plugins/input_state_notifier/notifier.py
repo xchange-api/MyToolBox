@@ -101,16 +101,17 @@ class InputStateMonitor:
         self._ctrl_down = False
 
         self._hook_id = None
-        self._hook_proc_cb = None
         self._win_event_hook = None
-        self._win_event_proc_cb = None
         self._running = False
+        self._poll_thread = None
+        self._stop_event = threading.Event()
 
         self._toast_duration = config.get("toast_duration", 0.8)
         self._debounce_interval = config.get("debounce_interval", 0.3)
         self._ime_check_delay = config.get("ime_check_delay", 0.05)
 
-        threading.Thread(target=self._ime_poll_loop, daemon=True).start()
+        self._hook_proc_cb = LowLevelKeyboardProc(self._hook_callback)
+        self._win_event_proc_cb = WinEventProc(self._on_foreground_change)
 
     def _get_ime_is_chinese(self):
         hwnd = win32gui.GetForegroundWindow()
@@ -162,8 +163,7 @@ class InputStateMonitor:
                 self._show_toast("ime", "ABC" if self._caps_on else "abc")
 
     def _ime_poll_loop(self):
-        while self._running:
-            time.sleep(60)
+        while not self._stop_event.wait(60):
             try:
                 self._ime_poll_once()
             except Exception:
@@ -186,22 +186,25 @@ class InputStateMonitor:
             pass
 
     def _hook_callback(self, nCode, wParam, lParam):
-        if nCode >= 0:
-            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if wParam == WM_KEYDOWN:
-                if kb.vkCode in (VK_LCONTROL, VK_RCONTROL):
-                    self._ctrl_down = True
-                elif kb.vkCode == VK_CAPITAL:
-                    self._on_caps_change(not self._caps_on)
-                elif kb.vkCode == VK_NUMLOCK:
-                    self._on_num_change(not self._num_on)
-            elif wParam == WM_KEYUP:
-                if kb.vkCode in (VK_LCONTROL, VK_RCONTROL):
-                    self._ctrl_down = False
-                elif kb.vkCode in (VK_LSHIFT, VK_RSHIFT):
-                    self._trigger_ime_check()
-                elif kb.vkCode == VK_SPACE and self._ctrl_down:
-                    self._trigger_ime_check()
+        try:
+            if nCode >= 0:
+                kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if wParam == WM_KEYDOWN:
+                    if kb.vkCode in (VK_LCONTROL, VK_RCONTROL):
+                        self._ctrl_down = True
+                    elif kb.vkCode == VK_CAPITAL:
+                        self._on_caps_change(not self._caps_on)
+                    elif kb.vkCode == VK_NUMLOCK:
+                        self._on_num_change(not self._num_on)
+                elif wParam == WM_KEYUP:
+                    if kb.vkCode in (VK_LCONTROL, VK_RCONTROL):
+                        self._ctrl_down = False
+                    elif kb.vkCode in (VK_LSHIFT, VK_RSHIFT):
+                        self._trigger_ime_check()
+                    elif kb.vkCode == VK_SPACE and self._ctrl_down:
+                        self._trigger_ime_check()
+        except Exception:
+            pass
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     def _trigger_ime_check(self):
@@ -221,14 +224,17 @@ class InputStateMonitor:
             pass
 
     def start(self):
-        self._hook_proc_cb = LowLevelKeyboardProc(self._hook_callback)
+        if self._running:
+            return
+
+        self._stop_event.clear()
+
         try:
             hmod = kernel32.GetModuleHandleW(None)
             self._hook_id = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc_cb, hmod, 0)
         except Exception:
             self._hook_id = None
 
-        self._win_event_proc_cb = WinEventProc(self._on_foreground_change)
         try:
             self._win_event_hook = user32.SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
@@ -238,9 +244,14 @@ class InputStateMonitor:
             self._win_event_hook = None
 
         self._running = True
+        self._poll_thread = threading.Thread(target=self._ime_poll_loop, daemon=True)
+        self._poll_thread.start()
 
     def stop(self):
         self._running = False
+        self._ime_check_seq += 1
+        self._stop_event.set()
+
         if self._win_event_hook:
             user32.UnhookWinEvent(self._win_event_hook)
             self._win_event_hook = None
