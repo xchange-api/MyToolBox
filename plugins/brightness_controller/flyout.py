@@ -253,6 +253,12 @@ class FlyoutWindow:
                 tk.Frame(inner, height=1, bg=SEP).pack(fill=tk.X)
             self._build_row(inner, mon, i)
 
+        self._win.update_idletasks()
+        req_w = inner.winfo_reqwidth() + FLYOUT_PAD * 2
+        if req_w > total_w:
+            total_w = req_w
+            self._win.geometry(f"{total_w}x{total_h}")
+
         self._position(total_w, total_h)
         for s in self._sliders:
             s._redraw()
