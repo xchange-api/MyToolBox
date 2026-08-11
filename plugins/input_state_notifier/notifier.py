@@ -26,6 +26,9 @@ user32.CallNextHookEx.restype = wintypes.LPARAM
 user32.GetKeyState.argtypes = [ctypes.c_int]
 user32.GetKeyState.restype = ctypes.c_short
 
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+
 user32.SendMessageW.argtypes = [
     wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM,
 ]
@@ -58,6 +61,8 @@ VK_RSHIFT = 0xA1
 VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
 VK_SPACE = 0x20
+VK_CONTROL = 0x11
+VK_MENU = 0x12
 ENGLISH_LANG_ID = 0x0409
 IME_CMODE_CHINESE = 0x0400
 EVENT_SYSTEM_FOREGROUND = 0x0003
@@ -99,6 +104,7 @@ class InputStateMonitor:
         self._last_toast = {"caps": 0.0, "num": 0.0, "ime": 0.0}
         self._ime_check_seq = 0
         self._ctrl_down = False
+        self._shift_solo = False
 
         self._hook_id = None
         self._win_event_hook = None
@@ -192,15 +198,27 @@ class InputStateMonitor:
                 if wParam == WM_KEYDOWN:
                     if kb.vkCode in (VK_LCONTROL, VK_RCONTROL):
                         self._ctrl_down = True
+                        self._shift_solo = False
+                    elif kb.vkCode in (VK_LSHIFT, VK_RSHIFT):
+                        self._shift_solo = not (
+                            self._ctrl_down
+                            or user32.GetAsyncKeyState(VK_CONTROL) & 0x8000
+                            or user32.GetAsyncKeyState(VK_MENU) & 0x8000
+                        )
                     elif kb.vkCode == VK_CAPITAL:
                         self._on_caps_change(not self._caps_on)
+                        self._shift_solo = False
                     elif kb.vkCode == VK_NUMLOCK:
                         self._on_num_change(not self._num_on)
+                        self._shift_solo = False
+                    else:
+                        self._shift_solo = False
                 elif wParam == WM_KEYUP:
                     if kb.vkCode in (VK_LCONTROL, VK_RCONTROL):
                         self._ctrl_down = False
                     elif kb.vkCode in (VK_LSHIFT, VK_RSHIFT):
-                        self._trigger_ime_check()
+                        if self._shift_solo:
+                            self._trigger_ime_check()
                     elif kb.vkCode == VK_SPACE and self._ctrl_down:
                         self._trigger_ime_check()
         except Exception:
