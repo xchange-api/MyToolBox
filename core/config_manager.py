@@ -21,6 +21,7 @@ _CONFIG = {
         },
         "brightness_controller": {
             "enabled": True,
+            "power_off_on_shutdown": False,
         },
     },
 }

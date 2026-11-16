@@ -24,6 +24,7 @@ a = Analysis(
         'plugins.brightness_controller.plugin',
         'plugins.brightness_controller.flyout',
         'plugins.brightness_controller.ddcci',
+        'plugins.brightness_controller.shutdown_hook',
         'win32com',
         'win32com.client',
         'pystray',

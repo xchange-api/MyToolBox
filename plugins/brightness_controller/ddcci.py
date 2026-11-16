@@ -6,10 +6,15 @@ DDC/CI 显示器亮度控制模块
 
 import ctypes
 import threading
+import time
 from ctypes import wintypes, Structure, POINTER, byref
 
 
 PHYSICAL_MONITOR_DESCRIPTION_SIZE = 128
+
+VCP_POWER_MODE = 0xD6
+POWER_ON = 1
+POWER_OFF = 4
 
 
 class PHYSICAL_MONITOR(Structure):
@@ -83,6 +88,10 @@ _GetMonitorBrightness.restype = wintypes.BOOL
 _SetMonitorBrightness = _dll.SetMonitorBrightness
 _SetMonitorBrightness.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 _SetMonitorBrightness.restype = wintypes.BOOL
+
+_SetVCPFeature = _dll.SetVCPFeature
+_SetVCPFeature.argtypes = [wintypes.HANDLE, wintypes.BYTE, wintypes.DWORD]
+_SetVCPFeature.restype = wintypes.BOOL
 
 # ---- 显示器枚举回调 ----
 
@@ -180,6 +189,49 @@ def set_brightness(monitor, value):
     v = max(monitor._min, min(monitor._max, value))
     if _SetMonitorBrightness(monitor.handle, v):
         monitor._current = v
+
+
+def set_power(handle, mode, retries=3):
+    """设置显示器电源模式（VCP 0xD6: 1=开 4=软关），I2C 偶发抖动自动重试"""
+    for _ in range(retries):
+        if _SetVCPFeature(handle, VCP_POWER_MODE, mode):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def enumerate_physical_handles():
+    """枚举所有物理显示器句柄，返回 [(handle, name)]，调用方负责 DestroyPhysicalMonitor"""
+    try:
+        hmonitors = _get_monitor_handles()
+    except Exception:
+        return []
+    result = []
+    for hmon in hmonitors:
+        count = wintypes.DWORD(0)
+        if not _GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, byref(count)) or count.value == 0:
+            continue
+        arr = (PHYSICAL_MONITOR * count.value)()
+        if not _GetPhysicalMonitorsFromHMONITOR(hmon, count.value, arr):
+            continue
+        for i in range(count.value):
+            result.append((
+                arr[i].hPhysicalMonitor,
+                arr[i].szPhysicalMonitorDescription.strip("\x00").strip(),
+            ))
+    return result
+
+
+def set_all_power(mode, retries=3):
+    """对所有 DDC 显示器发送电源模式指令，返回 (成功数, 总数)"""
+    monitors = enumerate_physical_handles()
+    success = 0
+    for handle, _name in monitors:
+        if set_power(handle, mode, retries):
+            success += 1
+    for handle, _name in monitors:
+        _DestroyPhysicalMonitor(handle)
+    return success, len(monitors)
 
 
 def destroy(monitor):
