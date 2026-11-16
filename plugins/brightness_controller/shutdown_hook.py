@@ -74,6 +74,7 @@ class ShutdownHook:
         if not self._enabled:
             self._log.info("关机关屏功能未启用 (power_off_on_shutdown=false)")
             return
+        self._install_retries = 0
         self._started = True
         self._app.schedule_ui(self._install_wndproc)
 
@@ -86,6 +87,8 @@ class ShutdownHook:
         return self._started
 
     def _install_wndproc(self):
+        if not self._started:
+            return
         try:
             hwnd_child = self._tk_root.winfo_id()
             hwnd_top = _GetAncestor(hwnd_child, GA_ROOT)

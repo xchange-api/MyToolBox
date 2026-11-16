@@ -65,7 +65,8 @@ class BrightnessPlugin(Plugin):
         self._tray_thread = threading.Thread(target=self._icon.run, daemon=True)
         self._tray_thread.start()
         self._start_hotkey()
-        self._start_shutdown_hook()
+        if bool(self._config.get("power_off_on_shutdown", False)):
+            self._start_shutdown_hook()
 
     def _wake_screen(self):
         """启动时点亮显示器：深度软关（0xD6=4）跨断电保存，重启时的视频信号
@@ -152,10 +153,12 @@ class BrightnessPlugin(Plugin):
         if not self.app:
             return
         want = bool(new_config.get("power_off_on_shutdown", False))
-        active = bool(self._shutdown_hook)
+        # 不能用 bool(self._shutdown_hook)：对象可能在功能未启用时就被创建，
+        # 那样「启动时关闭、运行中直接开启」会进入不了任何分支。
+        active = bool(self._shutdown_hook and self._shutdown_hook.is_active())
         if want and not active and self._flyout:
             self._start_shutdown_hook()
-        elif active and not want:
+        elif not want and self._shutdown_hook:
             self._shutdown_hook.stop()
             self._shutdown_hook = None
 
