@@ -11,3 +11,6 @@ __pycache__/
 
 # Runtime config (generated from code)
 config.json
+
+# IDE
+.idea/
