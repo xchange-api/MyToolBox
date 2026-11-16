@@ -64,7 +64,11 @@ VK_SPACE = 0x20
 VK_CONTROL = 0x11
 VK_MENU = 0x12
 ENGLISH_LANG_ID = 0x0409
-IME_CMODE_CHINESE = 0x0400
+# imm.h 中 IME_CMODE_CHINESE 是 IME_CMODE_NATIVE 的别名，值为 0x0001。
+# 0x0400 是 IME_CMODE_SYMBOL（中文标点），不能用来判断中英文模式：
+# Win10 22H2 的微软拼音默认开启中文标点，恰好同时带 0x0001|0x0400，
+# 所以旧代码在本机"碰巧"能用；Win Server 2019 等环境不置 0x0400 就会失效。
+IME_CMODE_NATIVE = 0x0001
 EVENT_SYSTEM_FOREGROUND = 0x0003
 WINEVENT_OUTOFCONTEXT = 0x0000
 
@@ -138,7 +142,7 @@ class InputStateMonitor:
             return False
 
         conv_mode = user32.SendMessageW(default_ime, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0)
-        return bool(conv_mode & IME_CMODE_CHINESE)
+        return bool(conv_mode & IME_CMODE_NATIVE)
 
     def _show_toast(self, text_type, text):
         now = time.monotonic()
