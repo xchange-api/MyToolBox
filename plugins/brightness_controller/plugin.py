@@ -5,6 +5,9 @@ import threading
 import time
 from ctypes import wintypes
 
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QSystemTrayIcon
+
 from core import is_frozen
 from core.logger import get_logger
 from plugins.base import Plugin
@@ -40,7 +43,6 @@ class BrightnessPlugin(Plugin):
         super().__init__()
         self._log = get_logger()
         self._icon = None
-        self._tray_thread = None
         self._flyout = None
         self._hotkey_thread = None
         self._hotkey_tid = 0
@@ -51,22 +53,29 @@ class BrightnessPlugin(Plugin):
         self._icon_path = _get_icon_path()
 
     def on_start(self):
-        from plugins.brightness_controller.flyout import FlyoutWindow, create_tray_icon
+        from plugins.brightness_controller.flyout import BrightnessFlyout
 
         enabled = bool(self._config.get("power_off_on_shutdown", False))
         if enabled:
             self._wake_screen()
-        self._flyout = FlyoutWindow(self.app, self.app.tk_root, self._icon_path)
+        self._flyout = BrightnessFlyout(self.app, self._icon_path)
 
-        def on_activate(*args):
-            self.app.schedule_ui(self._flyout.show)
+        icon = QIcon(self._icon_path)
+        if icon.isNull():
+            from plugins.brightness_controller.flyout import _make_sun_pixmap
+            icon = QIcon(_make_sun_pixmap(64))
+        self._icon = QSystemTrayIcon(icon, self.app)
+        self._icon.setToolTip("亮度控制")
+        self._icon.activated.connect(self._on_icon_activated)
+        self._icon.show()
 
-        self._icon = create_tray_icon(self._icon_path, on_activate)
-        self._tray_thread = threading.Thread(target=self._icon.run, daemon=True)
-        self._tray_thread.start()
         self._start_hotkey()
         if bool(self._config.get("power_off_on_shutdown", False)):
             self._start_shutdown_hook()
+
+    def _on_icon_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger and self._flyout:
+            self.app.schedule_ui(self._flyout.show)
 
     def _wake_screen(self):
         """启动时点亮显示器：深度软关（0xD6=4）跨断电保存，重启时的视频信号
@@ -89,7 +98,7 @@ class BrightnessPlugin(Plugin):
         from plugins.brightness_controller.shutdown_hook import ShutdownHook
 
         enabled = bool(self._config.get("power_off_on_shutdown", False))
-        self._shutdown_hook = ShutdownHook(self.app, self.app.tk_root, enabled)
+        self._shutdown_hook = ShutdownHook(self.app, enabled)
         self._shutdown_hook.start()
 
     def on_stop(self):
@@ -99,12 +108,13 @@ class BrightnessPlugin(Plugin):
             self._shutdown_hook = None
         if self._icon:
             try:
-                self._icon.stop()
+                self._icon.hide()
+                self._icon.deleteLater()
             except Exception:
                 pass
             self._icon = None
         if self._flyout:
-            self.app.schedule_ui(self._flyout.destroy)
+            self._flyout.destroy()
             self._flyout = None
 
     def _start_hotkey(self):
@@ -141,12 +151,21 @@ class BrightnessPlugin(Plugin):
                 break
             if msg.message == _WM_HOTKEY:
                 if msg.wParam == _HOTKEY_UP:
-                    self.app.schedule_ui(self._flyout.brightness_up)
+                    self.app.schedule_ui(self._hotkey_up)
                 elif msg.wParam == _HOTKEY_DOWN:
-                    self.app.schedule_ui(self._flyout.brightness_down)
+                    self.app.schedule_ui(self._hotkey_down)
 
         user32.UnregisterHotKey(None, _HOTKEY_UP)
         user32.UnregisterHotKey(None, _HOTKEY_DOWN)
+
+    def _hotkey_up(self):
+        # 在 GUI 线程执行，避免插件停止后访问已销毁的浮窗。
+        if self._flyout is not None:
+            self._flyout.brightness_up()
+
+    def _hotkey_down(self):
+        if self._flyout is not None:
+            self._flyout.brightness_down()
 
     def on_config_change(self, new_config):
         self._config = new_config

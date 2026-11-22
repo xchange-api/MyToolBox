@@ -51,14 +51,28 @@ def _run_helper_mode(args):
 
 
 def _run_core():
+    from PySide6.QtWidgets import QApplication
+
     from core.app import MyToolBoxApp
 
-    app = MyToolBoxApp()
+    qt_app = QApplication(sys.argv)
+    qt_app.setApplicationName("MyToolBox")
+    qt_app.setQuitOnLastWindowClosed(False)
+
+    app = MyToolBoxApp(qt_app)
     try:
         app.initialize()
-        app.run()
+    except Exception:
+        app.shutdown()
+        raise
+
+    try:
+        exit_code = app.run()
     except KeyboardInterrupt:
         app.shutdown()
+        exit_code = 0
+
+    raise SystemExit(exit_code)
 
 
 def _run_helper(plugin_name, core_pid):

@@ -1,7 +1,8 @@
 import os
-import queue
 import sys
-import threading
+
+from PySide6.QtCore import QObject, Qt
+from PySide6.QtWidgets import QApplication, QWidget
 
 from core import is_frozen
 from core.config_manager import ConfigManager
@@ -9,18 +10,34 @@ from core.ipc_server import IpcServer
 from core.logger import setup_logger, get_logger
 from core.plugin_manager import PluginManager
 from core.tray_manager import TrayManager
+from core.ui_dispatcher import UiDispatcher
 
 
 def _get_exe_path():
     return sys.executable
 
 
-class MyToolBoxApp:
-    def __init__(self):
+class MyToolBoxApp(QObject):
+    def __init__(self, qt_app: QApplication):
+        super().__init__()
+        self._qt_app = qt_app
+        self._qt_app.setQuitOnLastWindowClosed(False)
+
         self.config = ConfigManager()
         self.plugin_mgr = PluginManager(self.config)
         self.ipc = IpcServer()
         self.tray = None
+
+        self._dispatcher = UiDispatcher(self)
+        self._qt_app.aboutToQuit.connect(self.shutdown)
+
+        # 供关机关屏钩子子类化用的隐藏顶层窗口。必须在 GUI 线程创建，
+        # 并且整个生命周期内保持同一个 HWND。
+        self._native_window = QWidget()
+        self._native_window.setWindowFlags(Qt.WindowType.Tool)
+        self._native_window.setAttribute(
+            Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        self._native_window.winId()
 
         self._active_plugins = set()
         self._active_helper_plugins = set()
@@ -28,34 +45,21 @@ class MyToolBoxApp:
         self._helper_pids = {}
         self._autostart_enabled = False
 
-        self._exit_event = threading.Event()
         self._log = None
-
-        self._tk_root = None
-        self._ui_queue = queue.Queue()
+        self._shutting_down = False
 
     @property
-    def tk_root(self):
-        return self._tk_root
+    def qt_app(self):
+        return self._qt_app
+
+    @property
+    def native_window(self):
+        return self._native_window
 
     def schedule_ui(self, callback):
-        self._ui_queue.put(callback)
+        self._dispatcher.post(callback)
 
     def initialize(self):
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
-
-        import tkinter as tk
-        self._tk_root = tk.Tk()
-        self._tk_root.withdraw()
-        self._tk_root.after(100, self._poll_ui)
-
         self.plugin_mgr.discover()
         self.config.load(self.plugin_mgr.plugins)
         log_level = self.config.get_general().get("log_level", "info")
@@ -77,40 +81,37 @@ class MyToolBoxApp:
 
         self.tray = TrayManager(self)
 
-    def _poll_ui(self):
-        while not self._ui_queue.empty():
-            try:
-                callback = self._ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                callback()
-            except Exception as e:
-                if self._log:
-                    self._log.error(f"UI 回调执行失败: {e}")
-        if self._tk_root:
-            try:
-                self._tk_root.after(100, self._poll_ui)
-            except Exception:
-                pass
-
     def run(self):
-        self._tray_thread = threading.Thread(target=self.tray.start, daemon=True)
-        self._tray_thread.start()
-        self._tk_root.mainloop()
+        self.tray.start()
+        return self._qt_app.exec()
 
     def shutdown(self):
-        self._log.info("正在关闭 MyToolBox...")
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
+        if self._log:
+            self._log.info("正在关闭 MyToolBox...")
+
+        # 先通知 admin helper 退出，再关闭管道
+        for name in list(self._active_helper_plugins):
+            self._stop_helper_plugin(name)
+
         self.ipc.stop_all()
         self.plugin_mgr.stop_all()
+
         if self.tray:
             self.tray.stop()
-        if self._tk_root:
-            try:
-                self._tk_root.quit()
-                self._tk_root.destroy()
-            except Exception:
-                pass
+
+        self._dispatcher.stop()
+
+        try:
+            self._native_window.close()
+            self._native_window.deleteLater()
+        except Exception:
+            pass
+
+        self._qt_app.quit()
 
     def toggle_plugin(self, name):
         if name in self._active_plugins or name in self._active_helper_plugins:
@@ -167,18 +168,22 @@ class MyToolBoxApp:
             self._helper_pids[plugin_name] = msg.get("pid")
             self._helper_statuses.setdefault(plugin_name, {})["running"] = True
             self._active_plugins.add(plugin_name)
-            self._log.info(f"Helper 已连接: {plugin_name} (PID: {msg.get('pid')})")
-            self._update_menu()
+            if self._log:
+                self._log.info(
+                    f"Helper 已连接: {plugin_name} (PID: {msg.get('pid')})")
+            self.schedule_ui(self._update_menu)
         elif msg.get("type") == "status":
             self._helper_statuses[plugin_name] = {
                 "running": msg.get("running", False),
                 "pids": msg.get("pids", []),
             }
-            self._update_menu()
+            self.schedule_ui(self._update_menu)
         elif msg.get("type") == "log":
             level = msg.get("level", "info")
             text = msg.get("message", "")
-            getattr(self._log, level, self._log.info)(f"[{plugin_name}] {text}")
+            if self._log:
+                getattr(self._log, level, self._log.info)(
+                    f"[{plugin_name}] {text}")
 
     def _update_menu(self):
         if self.tray:

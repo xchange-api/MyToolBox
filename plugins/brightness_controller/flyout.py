@@ -2,13 +2,17 @@ import ctypes
 import math
 import threading
 import winreg
-from ctypes import wintypes
 
-import pystray
-from PIL import Image
+from PySide6.QtCore import QPoint, QRectF, Qt, QTimer
+from PySide6.QtGui import (
+    QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter, QPen, QPixmap,
+)
+from PySide6.QtWidgets import (
+    QFrame, QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget,
+)
 
 from plugins.brightness_controller.ddcci import (
-    get_brightness, set_brightness_async,
+    get_brightness, set_brightness, set_brightness_async,
     cleanup, enumerate_monitors_async,
 )
 
@@ -21,6 +25,7 @@ SEP = "#2d2d2d"
 TRACK_H = 1
 THUMB_W = 8
 THUMB_H = 24
+TRACK_INSET = 10
 
 FLYOUT_PAD = 15
 ROW_H = 42
@@ -60,250 +65,308 @@ def get_accent_color():
     return "#0078d4"
 
 
-class _MONITORINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("rcMonitor", wintypes.RECT),
-        ("rcWork", wintypes.RECT),
-        ("dwFlags", wintypes.DWORD),
-    ]
+def _make_sun_pixmap(size=20):
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    cx = cy = size / 2.0
+    r = size * 0.26
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(SUN))
+    painter.drawEllipse(QPoint(int(cx), int(cy)), int(r), int(r))
+
+    painter.setPen(QPen(QColor(SUN), 1))
+    for degree in range(0, 360, 45):
+        rad = math.radians(degree)
+        x1 = cx + r * 1.35 * math.cos(rad)
+        y1 = cy + r * 1.35 * math.sin(rad)
+        x2 = cx + r * 1.85 * math.cos(rad)
+        y2 = cy + r * 1.85 * math.sin(rad)
+        painter.drawLine(
+            QPoint(int(round(x1)), int(round(y1))),
+            QPoint(int(round(x2)), int(round(y2))),
+        )
+
+    painter.end()
+    return pix
 
 
-def get_taskbar_info():
-    MONITOR_DEFAULTTOPRIMARY = 1
-    try:
-        hmon = ctypes.windll.user32.MonitorFromPoint(
-            wintypes.POINT(0, 0), MONITOR_DEFAULTTOPRIMARY)
-        mi = _MONITORINFO()
-        mi.cbSize = ctypes.sizeof(_MONITORINFO)
-        if not ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-            return "BOTTOM", (0, 0, 0, 0)
-        b, w = mi.rcMonitor, mi.rcWork
-        bw, bh = b.right - b.left, b.bottom - b.top
-        ww, wh = w.right - w.left, w.bottom - w.top
-        if b.left < w.left:
-            pos = "LEFT"
-        elif b.top < w.top:
-            pos = "TOP"
-        elif bw > ww:
-            pos = "RIGHT"
-        else:
-            pos = "BOTTOM"
-        return pos, (w.left, w.top, w.right, w.bottom)
-    except Exception:
-        return "BOTTOM", (0, 0, 0, 0)
+class BrightnessSlider(QSlider):
+    """与旧版 Canvas 滑块行为对齐的 Qt 滑块。"""
 
-
-class _Slider:
-    """Custom horizontal slider using tkinter Canvas."""
-
-    def __init__(self, parent, width, height, value=50, command=None, accent="#0078d4"):
-        import tkinter as tk
-        self._frame = tk.Frame(parent, width=width, height=height, bg=BG)
-        self._val = max(0, min(100, value))
+    def __init__(self, value=50, command=None, accent="#0078d4", parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
         self._cmd = command
-        self._sw = width
-        self._sh = height
         self._accent = accent
-        self._drag = False
-        self._frame.pack_propagate(False)
 
-        self._can = tk.Canvas(self._frame, width=width, height=height, bg=BG, highlightthickness=0)
-        self._can.pack(fill=tk.BOTH, expand=True)
-        self._redraw()
-        self._can.bind("<Button-1>", self._click)
-        self._can.bind("<B1-Motion>", self._drag_ev)
-        self._can.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", False))
-        self._can.bind("<MouseWheel>", self._wheel)
+        self.setRange(0, 100)
+        self.setSingleStep(1)
+        self.setPageStep(5)
+        self.setValue(max(0, min(100, int(value))))
+        self.setFixedWidth(SLIDER_W)
+        self.setFixedHeight(ROW_H)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.valueChanged.connect(self._on_value_changed)
 
-    @property
-    def widget(self):
-        return self._frame
+    def _value_from_x(self, x):
+        left = float(TRACK_INSET)
+        right = self.width() - float(TRACK_INSET)
+        if right <= left:
+            return self.value()
+        ratio = (x - left) / (right - left)
+        return max(0, min(100, int(round(ratio * 100))))
 
-    def _redraw(self):
-        self._can.delete("all")
-        w, h = self._sw, self._sh
-        pad, yc = 10, h // 2
-        th = TRACK_H
-        tw = w - pad * 2
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
 
-        self._can.create_rectangle(pad, yc - th, pad + tw, yc + th, fill=TRACK, outline="")
+        width = float(self.width())
+        center_y = self.height() / 2.0
+        left = float(TRACK_INSET)
+        right = width - float(TRACK_INSET)
+        if right <= left:
+            painter.end()
+            return
 
-        fw = int(tw * self._val / 100)
-        if fw > 0:
-            self._can.create_rectangle(pad, yc - th, pad + fw, yc + th, fill=self._accent, outline="")
+        ratio = self.value() / 100.0
+        thumb_center_x = left + (right - left) * ratio
+        track_top = center_y - TRACK_H
+        track_height = TRACK_H * 2
 
-        tx = pad + int(self._val * tw / 100)
-        self._draw_pill(tx, yc, THUMB_W, THUMB_H, fill=self._accent, outline="")
+        # 背景轨道
+        painter.setBrush(QColor(TRACK))
+        painter.drawRect(QRectF(left, track_top, right - left, track_height))
 
-    def _draw_pill(self, cx, cy, pw, ph, **kw):
-        r = pw / 2
-        pts = []
-        for a in range(180, 361, 10):
-            rad = math.radians(a)
-            pts.append(cx + r * math.cos(rad))
-            pts.append(cy - ph / 2 + r + r * math.sin(rad))
-        pts.append(cx + r)
-        pts.append(cy + ph / 2 - r)
-        for a in range(0, 181, 10):
-            rad = math.radians(a)
-            pts.append(cx + r * math.cos(rad))
-            pts.append(cy + ph / 2 - r + r * math.sin(rad))
-        pts.append(cx - r)
-        pts.append(cy - ph / 2 + r)
-        self._can.create_polygon(pts, smooth=True, **kw)
+        # 已填充部分：从轨道起点画到滑块中心，不留空隙
+        fill_width = thumb_center_x - left
+        if fill_width > 0:
+            painter.setBrush(QColor(self._accent))
+            painter.drawRect(QRectF(left, track_top, fill_width, track_height))
 
-    def _x_to_v(self, x):
-        pad = 10
-        cw = self._sw
-        if cw <= pad * 2:
-            return 50
-        return max(0, min(100, int((x - pad) / (cw - pad * 2) * 100)))
+        # 滑块
+        painter.setBrush(QColor(self._accent))
+        painter.drawRoundedRect(
+            QRectF(
+                thumb_center_x - THUMB_W / 2.0,
+                center_y - THUMB_H / 2.0,
+                THUMB_W,
+                THUMB_H,
+            ),
+            THUMB_W / 2.0,
+            THUMB_W / 2.0,
+        )
 
-    def _click(self, e):
-        self._drag = True
-        v = self._x_to_v(e.x)
-        if v != self._val:
-            self._val = v
-            self._redraw()
-            if self._cmd:
-                self._cmd(self._val)
+        painter.end()
 
-    def _drag_ev(self, e):
-        if self._drag:
-            v = self._x_to_v(max(10, min(e.x, self._sw - 10)))
-            if v != self._val:
-                self._val = v
-                self._redraw()
-                if self._cmd:
-                    self._cmd(self._val)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setSliderDown(True)
+            self.setValue(self._value_from_x(event.position().x()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
-    def _wheel(self, e):
-        d = 5 if e.delta > 0 or e.num == 4 else -5
-        self._val = max(0, min(100, self._val + d))
-        self._redraw()
+    def mouseMoveEvent(self, event):
+        if self.isSliderDown():
+            self.setValue(self._value_from_x(event.position().x()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        delta = 5 if event.angleDelta().y() > 0 else -5
+        self.setValue(max(0, min(100, self.value() + delta)))
+        event.accept()
+
+    def _on_value_changed(self, value):
         if self._cmd:
-            self._cmd(self._val)
+            self._cmd(value)
 
 
-class FlyoutWindow:
-    """Manages the brightness flyout popup window. Must be used on the tkinter main thread."""
+class BrightnessFlyout(QWidget):
+    """亮度浮窗。必须在 Qt GUI 线程创建和使用。"""
 
-    def __init__(self, app, tk_root, icon_path):
+    def __init__(self, app, icon_path):
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool,
+        )
         self.app = app
-        self._root = tk_root
         self._icon_path = icon_path
         self._accent = get_accent_color()
-        self._win = None
+
+        self.setObjectName("brightnessFlyout")
+        self.setStyleSheet(f"#brightnessFlyout {{ background: {BG}; }}")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(
+            FLYOUT_PAD, FLYOUT_PAD, FLYOUT_PAD, FLYOUT_PAD)
+        self._layout.setSpacing(0)
+
         self._sliders = []
+        self._labels = []
         self._monitors = []
-        self._timer = None
+        self._generation = 0
         self._prev_mouse = False
-        self._lock = threading.Lock()
+        self._setting_values = False
+        self._debounce_timers = {}
+        self._pending = {}
+
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self._close)
+
+        self._outside_timer = QTimer(self)
+        self._outside_timer.setInterval(50)
+        self._outside_timer.timeout.connect(self._check_outside)
 
     def show(self):
-        with self._lock:
-            self._show_internal()
-
-    def _show_internal(self):
-        if self._win and self._win.winfo_exists():
-            self._win.lift()
-            self._win.focus_force()
+        if self.isVisible():
+            self.raise_()
+            self.activateWindow()
             self._schedule()
             return
 
-        cleanup(self._monitors)
-        self._monitors = []
-        self._win = None
+        # 清掉上一次可能残留的显示器句柄和防抖计时器
+        self._close()
 
-        enumerate_monitors_async(lambda monitors:
-            self.app.schedule_ui(lambda: self._build_ui(monitors)))
+        self._generation += 1
+        generation = self._generation
 
-    def _build_ui(self, monitors):
+        enumerate_monitors_async(
+            lambda monitors: self.app.schedule_ui(
+                lambda: self._on_monitors(generation, monitors)
+            )
+        )
+
+    def _on_monitors(self, generation, monitors):
+        if generation != self._generation:
+            cleanup(monitors)
+            return
         self._monitors = monitors
         if not self._monitors:
             return
+        self._build_ui()
 
-        import tkinter as tk
+    def _build_ui(self):
+        self._clear_rows()
 
-        self._win = tk.Toplevel(self._root)
-        self._win.overrideredirect(True)
-        self._win.attributes("-topmost", True)
-        self._win.configure(bg=BG)
-        self._win.bind("<Escape>", lambda e: self._close())
-        self._win.protocol("WM_DELETE_WINDOW", self._close)
+        for i, monitor in enumerate(self._monitors):
+            if i > 0:
+                separator = QFrame(self)
+                separator.setFixedHeight(1)
+                separator.setStyleSheet(f"background: {SEP};")
+                self._layout.addWidget(separator)
+            self._layout.addWidget(self._build_row(monitor))
 
         n = len(self._monitors)
         total_h = n * ROW_H + (n - 1) * 1 + FLYOUT_PAD * 2
         total_w = 30 + SLIDER_W + 46 + FLYOUT_PAD * 2
 
-        self._win.geometry(f"{total_w}x{total_h}")
-
-        inner = tk.Frame(self._win, bg=BG)
-        inner.pack(fill=tk.BOTH, expand=True, padx=FLYOUT_PAD, pady=FLYOUT_PAD)
-
-        self._sliders = []
-
-        for i, mon in enumerate(self._monitors):
-            if i > 0:
-                tk.Frame(inner, height=1, bg=SEP).pack(fill=tk.X)
-            self._build_row(inner, mon, i)
-
-        self._win.update_idletasks()
-        req_w = inner.winfo_reqwidth() + FLYOUT_PAD * 2
-        if req_w > total_w:
-            total_w = req_w
-            self._win.geometry(f"{total_w}x{total_h}")
-
+        self.setFixedSize(total_w, total_h)
         self._position(total_w, total_h)
-        for s in self._sliders:
-            s._redraw()
-        self._win.focus_force()
+        super().show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
         self._schedule()
-        self._prev_mouse = bool(ctypes.windll.user32.GetAsyncKeyState(1) & 0x8000)
-        self._win.after(100, self._check_outside)
+        self._prev_mouse = bool(
+            ctypes.windll.user32.GetAsyncKeyState(1) & 0x8000)
+        self._outside_timer.start()
 
-    def _build_row(self, parent, mon, idx):
-        import tkinter as tk
-        from PIL import ImageTk
+    def _build_row(self, monitor):
+        row = QWidget(self)
+        row.setFixedHeight(ROW_H)
 
-        row = tk.Frame(parent, bg=BG)
-        row.pack(fill=tk.X)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        cur = get_brightness(mon)
+        icon = QLabel(row)
+        icon.setFixedSize(24, ROW_H)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setPixmap(self._load_icon_pixmap())
+        layout.addWidget(icon)
 
-        icon_img = None
-        try:
-            pil_img = Image.open(self._icon_path).resize((20, 20), Image.LANCZOS)
-            icon_img = ImageTk.PhotoImage(pil_img)
-        except Exception:
-            pass
+        current = get_brightness(monitor)
 
-        can = tk.Canvas(row, width=24, height=ROW_H, bg=BG, highlightthickness=0)
-        can.pack(side=tk.LEFT)
-        cy = ROW_H // 2
-        if icon_img:
-            can.create_image(12, cy, image=icon_img)
-            can.image = icon_img
-        else:
-            can.create_oval(2, cy - 9, 20, cy + 9, fill=SUN, outline="")
-            for d in range(0, 360, 45):
-                rad = math.radians(d)
-                can.create_line(12 + int(7 * math.cos(rad)), cy + int(7 * math.sin(rad)),
-                                12 + int(12 * math.cos(rad)), cy + int(12 * math.sin(rad)),
-                                fill=SUN, width=1)
+        value_label = QLabel(str(current), row)
+        value_label.setFixedWidth(46)
+        value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        value_label.setFont(QFont("Segoe UI", 18))
+        value_label.setStyleSheet(f"color: {FG}; background: transparent;")
 
-        pv = tk.StringVar(value=f"{cur}")
-        tk.Label(row, textvariable=pv, fg=FG, bg=BG, font=("Segoe UI", 18),
-                 width=4, anchor=tk.E).pack(side=tk.RIGHT)
+        slider = BrightnessSlider(
+            current,
+            command=lambda value, m=monitor, label=value_label:
+                self._on_slider_changed(m, value, label),
+            accent=self._accent,
+            parent=row,
+        )
 
-        sl = _Slider(row, SLIDER_W, ROW_H, cur,
-                      lambda v, m=mon, p=pv: (
-                          p.set(f"{int(v)}"), self._schedule(), set_brightness_async(m, int(v))
-                      ),
-                      accent=self._accent)
-        sl.widget.pack(side=tk.RIGHT, padx=(4, 2))
-        self._sliders.append(sl)
+        layout.addStretch(1)
+        layout.addWidget(slider)
+        layout.addWidget(value_label)
+
+        self._sliders.append(slider)
+        self._labels.append(value_label)
+        return row
+
+    def _load_icon_pixmap(self):
+        pix = QIcon(self._icon_path).pixmap(20, 20)
+        if pix.isNull():
+            return _make_sun_pixmap(20)
+        return pix
+
+    def _on_slider_changed(self, monitor, value, label):
+        if self._setting_values:
+            return
+        label.setText(str(int(value)))
+        self._schedule()
+        self._queue_brightness(monitor, int(value))
+
+    def _queue_brightness(self, monitor, value):
+        key = id(monitor)
+        self._pending[key] = (monitor, value)
+
+        timer = self._debounce_timers.get(key)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(40)
+            timer.timeout.connect(lambda k=key: self._flush_brightness(k))
+            self._debounce_timers[key] = timer
+        timer.start()
+
+    def _flush_brightness(self, key):
+        item = self._pending.pop(key, None)
+        if item is None:
+            return
+        monitor, value = item
+        set_brightness_async(monitor, value)
+
+    def _take_pending(self):
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for timer in self._debounce_timers.values():
+            timer.stop()
+        return pending
 
     def brightness_up(self):
         self._adjust_brightness(10)
@@ -312,123 +375,138 @@ class FlyoutWindow:
         self._adjust_brightness(-10)
 
     def _adjust_brightness(self, delta):
-        monitors = list(self._monitors) if self._monitors else None
-        if not monitors:
-            enumerate_monitors_async(lambda mons: self._do_adjust(mons, delta))
-        else:
-            self._do_adjust(monitors, delta)
+        if self._monitors:
+            self._do_adjust(list(self._monitors), delta, cleanup_after=False)
+            return
+        enumerate_monitors_async(
+            lambda monitors: self.app.schedule_ui(
+                lambda: self._do_adjust(
+                    monitors, delta, cleanup_after=True)
+            )
+        )
 
-    def _do_adjust(self, monitors, delta):
+    def _do_adjust(self, monitors, delta, cleanup_after=False):
         def _worker():
-            new_vals = []
-            for mon in monitors:
+            new_values = []
+            for monitor in monitors:
                 try:
-                    cur = get_brightness(mon)
-                    new = max(0, min(100, cur + delta))
-                    set_brightness_async(mon, new)
-                    new_vals.append(new)
+                    current = get_brightness(monitor)
+                    new_value = max(0, min(100, current + delta))
+                    set_brightness(monitor, new_value)
+                    new_values.append(new_value)
                 except Exception:
-                    new_vals.append(None)
-            if self._win and self._win.winfo_exists():
-                self.app.schedule_ui(lambda: self._update_sliders(new_vals))
+                    new_values.append(None)
+            if cleanup_after:
+                cleanup(monitors)
+            self.app.schedule_ui(lambda: self._update_sliders(new_values))
+
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _update_sliders(self, vals):
-        for i, sl in enumerate(self._sliders):
-            if i < len(vals) and vals[i] is not None:
-                sl._val = vals[i]
-                sl._redraw()
+    def _update_sliders(self, values):
+        self._setting_values = True
+        try:
+            for i, (slider, label) in enumerate(
+                    zip(self._sliders, self._labels)):
+                if i < len(values) and values[i] is not None:
+                    slider.setValue(values[i])
+                    label.setText(str(int(values[i])))
+        finally:
+            self._setting_values = False
 
     def _position(self, w, h):
-        pos, work = get_taskbar_info()
-        wl, wt, wr, wb = work
-        if pos == "LEFT":
-            x, y = wl, wb - h
-        elif pos == "TOP":
-            x, y = wr - w, wt
+        # 使用 QScreen 的逻辑坐标（Qt move() 也是逻辑像素），避免缩放屏错位。
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        full = screen.geometry()
+
+        left = avail.x()
+        top = avail.y()
+        right = avail.x() + avail.width()
+        bottom = avail.y() + avail.height()
+
+        if full.x() < avail.x():
+            # 任务栏在左侧
+            x, y = left, bottom - h
+        elif full.y() < avail.y():
+            # 任务栏在顶部
+            x, y = right - w, top
         else:
-            x, y = wr - w, wb - h
-        self._win.geometry(f"+{x}+{y}")
+            # 任务栏在底部或右侧
+            x, y = right - w, bottom - h
+        self.move(x, y)
 
     def _check_outside(self):
-        if not self._win or not self._win.winfo_exists():
+        if not self.isVisible():
+            self._outside_timer.stop()
             return
-        pressed = ctypes.windll.user32.GetAsyncKeyState(1) & 0x8000
+
+        pressed = bool(ctypes.windll.user32.GetAsyncKeyState(1) & 0x8000)
         if pressed and not self._prev_mouse:
-            pt = wintypes.POINT()
-            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            fx = self._win.winfo_rootx()
-            fy = self._win.winfo_rooty()
-            fw = self._win.winfo_width()
-            fh = self._win.winfo_height()
-            if not (fx <= pt.x <= fx + fw and fy <= pt.y <= fy + fh):
+            if not self.frameGeometry().contains(QCursor.pos()):
                 self._close()
                 return
         self._prev_mouse = pressed
-        self._win.after(50, self._check_outside)
 
     def _schedule(self):
-        self._cancel()
-        if self._win and self._win.winfo_exists():
-            self._timer = self._win.after(AUTO_MS, self._close)
+        self._auto_timer.start(AUTO_MS)
 
-    def _cancel(self):
-        if self._timer:
-            try:
-                if self._win:
-                    self._win.after_cancel(self._timer)
-            except Exception:
-                pass
-            self._timer = None
+    def _clear_rows(self):
+        self._sliders = []
+        self._labels = []
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for timer in self._debounce_timers.values():
+            timer.stop()
+            timer.deleteLater()
+        self._debounce_timers.clear()
+        self._pending.clear()
 
     def _close(self):
-        with self._lock:
-            self._cancel()
-            if self._win:
-                try:
-                    self._win.destroy()
-                except Exception:
-                    pass
-                self._win = None
-                self._sliders = []
+        self._generation += 1
+        self._auto_timer.stop()
+        self._outside_timer.stop()
+
+        pending = self._take_pending()
+        monitors = self._monitors
+        self._monitors = []
+
+        self._clear_rows()
+        self.hide()
+
+        if pending or monitors:
+            def _worker():
+                for monitor, value in pending:
+                    try:
+                        set_brightness(monitor, value)
+                    except Exception:
+                        pass
+                cleanup(monitors)
+
+            threading.Thread(target=_worker, daemon=True).start()
 
     def close(self):
         self._close()
 
     def destroy(self):
         self._close()
-        cleanup(self._monitors)
-        self._monitors = []
+        self.deleteLater()
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
-def create_tray_icon(icon_path, on_activate):
-    """Create a pystray Icon for brightness control.
+    def closeEvent(self, event):
+        self._close()
+        event.accept()
 
-    Left-click triggers on_activate. No right-click menu.
-    """
-    try:
-        icon_img = Image.open(icon_path)
-    except Exception:
-        icon_img = _fallback_icon()
-
-    menu = pystray.Menu(
-        pystray.MenuItem("显示", on_activate, default=True, visible=False),
-    )
-
-    icon = pystray.Icon("brightness", icon_img, "亮度控制", menu)
-    return icon
-
-
-def _fallback_icon():
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    from PIL import ImageDraw
-    d = ImageDraw.Draw(img)
-    cx = cy = 32
-    r = 30
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 200, 50, 180), outline="#ffc864", width=2)
-    for a in range(0, 360, 30):
-        rad = math.radians(a)
-        d.line([cx + int(r * 0.6 * math.cos(rad)), cy + int(r * 0.6 * math.sin(rad)),
-                cx + int(r * 0.95 * math.cos(rad)), cy + int(r * 0.95 * math.sin(rad))],
-               fill="#ffc864", width=2)
-    return img
+    def hideEvent(self, event):
+        self._outside_timer.stop()
+        super().hideEvent(event)

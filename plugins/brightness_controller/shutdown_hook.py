@@ -14,16 +14,17 @@ Windows 关机/重启时（不含注销）在进程退出前对 DDC/CI 显示器
     后重启时的视频信号唤不醒显示器，必须靠 DDC 指令或物理按键）。
 
 组成:
-    ShutdownHook - 子类化 Tk 顶层窗口 WndProc 拦截 WM_ENDSESSION，在系统
-    给出的数秒内同步完成 DDC 关屏。
+    ShutdownHook - 子类化隐藏 Qt 顶层窗口的 WndProc 拦截 WM_ENDSESSION，
+    在系统给出的数秒内同步完成 DDC 关屏。
 """
 
 import ctypes
-import time
 from ctypes import (
-    WINFUNCTYPE, POINTER, byref, c_ssize_t, c_void_p,
+    WINFUNCTYPE, c_ssize_t, c_void_p,
 )
 from ctypes import wintypes
+
+from PySide6.QtCore import QTimer
 
 from core.logger import get_logger
 from plugins.brightness_controller import ddcci
@@ -34,12 +35,14 @@ GA_ROOT = 2
 SM_SHUTTINGDOWN = 0x2000
 
 _LRESULT = c_ssize_t
-_WNDPROC = WINFUNCTYPE(_LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+_WNDPROC = WINFUNCTYPE(
+    _LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
 _user32 = ctypes.windll.user32
 
 _CallWindowProcW = _user32.CallWindowProcW
-_CallWindowProcW.argtypes = [c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_CallWindowProcW.argtypes = [
+    c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 _CallWindowProcW.restype = _LRESULT
 
 _GetAncestor = _user32.GetAncestor
@@ -56,11 +59,10 @@ _SetWindowLongPtrW.restype = c_ssize_t
 
 
 class ShutdownHook:
-    """拦截 WM_ENDSESSION，在 Tk 退出进程前关闭显示器"""
+    """拦截 WM_ENDSESSION，在 Qt 退出进程前关闭显示器"""
 
-    def __init__(self, app, tk_root, enabled=True):
-        self._app = app
-        self._tk_root = tk_root
+    def __init__(self, app, enabled=True):
+        self._window = app.native_window
         self._enabled = enabled
         self._log = get_logger()
         self._started = False
@@ -76,12 +78,11 @@ class ShutdownHook:
             return
         self._install_retries = 0
         self._started = True
-        self._app.schedule_ui(self._install_wndproc)
+        self._install_wndproc()
 
     def stop(self):
         self._started = False
-        if self._installed:
-            self._app.schedule_ui(self._uninstall_wndproc)
+        self._uninstall_wndproc()
 
     def is_active(self):
         return self._started
@@ -90,29 +91,37 @@ class ShutdownHook:
         if not self._started:
             return
         try:
-            hwnd_child = self._tk_root.winfo_id()
-            hwnd_top = _GetAncestor(hwnd_child, GA_ROOT)
-            if not hwnd_top or hwnd_top == hwnd_child:
-                # TkTopLevel 包装窗口在 mainloop 启动后才由 Tk 创建，稍后重试
-                self._install_retries += 1
-                if self._install_retries < 50:
-                    self._tk_root.after(200, self._install_wndproc)
-                    return
-                self._log.error("Tk 顶层包装窗口未出现，关机关屏功能停用")
+            hwnd = int(self._window.winId())
+            if not hwnd:
+                self._retry_install("隐藏窗口尚未创建原生句柄")
                 return
+
+            # 隐藏 QWidget 本身就是顶层窗口；GetAncestor 通常返回它自己。
+            hwnd_top = _GetAncestor(hwnd, GA_ROOT) or hwnd
+
             self._proc_cb = _WNDPROC(self._wndproc)
             proc_addr = ctypes.cast(self._proc_cb, c_void_p).value
             old = _SetWindowLongPtrW(hwnd_top, GWLP_WNDPROC, proc_addr)
             if not old:
-                self._log.error(f"子类化 Tk 窗口失败: {ctypes.GetLastError()}")
+                self._log.error(
+                    f"子类化 Qt 窗口失败: {ctypes.GetLastError()}")
                 self._proc_cb = None
                 return
             self._hwnd = hwnd_top
             self._old_proc = old
             self._installed = True
-            self._log.info(f"关机关屏钩子已安装 (hwnd=0x{hwnd_top:X})")
+            self._log.info(
+                f"关机关屏钩子已安装 (hwnd=0x{hwnd_top:X})")
         except Exception as e:
             self._log.error(f"安装关机关屏钩子失败: {e}")
+
+    def _retry_install(self, reason):
+        self._install_retries += 1
+        if self._install_retries < 50:
+            self._log.debug(f"{reason}，稍后重试")
+            QTimer.singleShot(200, self._install_wndproc)
+            return
+        self._log.error(f"{reason}，关机关屏功能停用")
 
     def _uninstall_wndproc(self):
         if not self._installed:
@@ -130,7 +139,8 @@ class ShutdownHook:
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == WM_ENDSESSION and wparam:
             self._handle_session_end()
-        return _CallWindowProcW(self._old_proc, hwnd, msg, wparam, lparam)
+        return _CallWindowProcW(
+            self._old_proc, hwnd, msg, wparam, lparam)
 
     def _handle_session_end(self):
         try:

@@ -189,12 +189,12 @@ class InputStateMonitor:
         except Exception:
             return None
 
-    def _show_toast(self, text_type, text):
+    def _show_toast(self, text_type, text, strike=False):
         now = time.monotonic()
         if now - self._last_toast.get(text_type, 0) < self._debounce_interval:
             return
         self._last_toast[text_type] = now
-        self._popup.show(text, self._toast_duration)
+        self._popup.show(text, self._toast_duration, strike)
 
     def _on_caps_change(self, state):
         self._caps_on = state
@@ -206,7 +206,7 @@ class InputStateMonitor:
         self._num_on = state
         if state != self._prev_num:
             self._prev_num = state
-            self._show_toast("num", "123" if state else "1\u03362\u03363\u0336")
+            self._show_toast("num", "123", strike=not state)
 
     def _show_ime_toast(self, is_chinese):
         if is_chinese and not self._caps_on:
