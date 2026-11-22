@@ -2,16 +2,19 @@
 """
 关机关屏钩子
 
-Windows 关机/重启时（不含注销）在进程退出前对 DDC/CI 显示器发送 VCP 0xD6=4
+Windows 关机时（不含注销/重启）在进程退出前对 DDC/CI 显示器发送 VCP 0xD6=4
 软关机指令，让显示器进入深度关闭而不是无信号待机。
 
-为什么不再区分关机与重启:
-    系统事件日志 1074 是唯一能读取动作类型（关机/重启/注销）的来源，但本机
-    开启快速启动后，"关机"实为 注销 -> 休眠 -> 断电，事件日志服务常常来不及
-    把 1074 落盘，实测 7 次关机只有 2 次有记录。而 WM_ENDSESSION 只能通过
-    SM_SHUTTINGDOWN 区分"关机（含重启）"与"注销"，无法区分关机/重启。
-    因此改为两者都关屏，由插件启动时发送 VCP 0xD6=1 自动点亮（实测深度关闭
-    后重启时的视频信号唤不醒显示器，必须靠 DDC 指令或物理按键）。
+为什么区分关机与重启:
+    早期尝试读事件日志 1074，但快速启动开启时重启经常不写 1074。
+    内核的 Kernel-Power 109 更可靠（5=重启，6=关机断电），但它在
+    WM_ENDSESSION 之后才写入，普通桌面进程来不及读取。
+    因此改为读 User32 1074（在 WM_QUERYENDSESSION 时通常已写入），
+    param5 为"重启"或"关闭电源"。1074 缺失时保守地不关屏。
+
+注销:
+    WM_ENDSESSION 的 lParam 带 ENDSESSION_LOGOFF 时是用户注销，直接跳过。
+    SM_SHUTTINGDOWN 在部分系统上注销时也可能为非零，不能单独依赖。
 
 组成:
     ShutdownHook - 子类化隐藏 Qt 顶层窗口的 WndProc 拦截 WM_ENDSESSION，
@@ -19,6 +22,8 @@ Windows 关机/重启时（不含注销）在进程退出前对 DDC/CI 显示器
 """
 
 import ctypes
+import time
+import xml.etree.ElementTree as ET
 from ctypes import (
     WINFUNCTYPE, c_ssize_t, c_void_p,
 )
@@ -29,10 +34,14 @@ from PySide6.QtCore import QTimer
 from core.logger import get_logger
 from plugins.brightness_controller import ddcci
 
+WM_QUERYENDSESSION = 0x0011
 WM_ENDSESSION = 0x0016
+ENDSESSION_LOGOFF = 0x80000000
 GWLP_WNDPROC = -4
 GA_ROOT = 2
 SM_SHUTTINGDOWN = 0x2000
+
+_EVENT_NS = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
 
 _LRESULT = c_ssize_t
 _WNDPROC = WINFUNCTYPE(
@@ -58,6 +67,63 @@ _SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, c_ssize_t]
 _SetWindowLongPtrW.restype = c_ssize_t
 
 
+def _query_latest_1074():
+    """返回最近的 User32 1074 事件 (param5, EventRecordID)。
+
+    param5 是本地化字符串：中文为"重启"/"关闭电源"，
+    英文为 "restart"/"shutdown"。查询失败时返回 (None, 0)。
+    """
+    try:
+        import win32evtlog
+
+        query = win32evtlog.EvtQuery(
+            "System",
+            win32evtlog.EvtQueryReverseDirection,
+            "*[System[Provider[@Name='User32'] and (EventID=1074)]]",
+        )
+        events = win32evtlog.EvtNext(query, 3)
+    except Exception:
+        return None, 0
+
+    for event in events:
+        try:
+            xml_text = win32evtlog.EvtRender(
+                event, win32evtlog.EvtRenderEventXml)
+            root = ET.fromstring(xml_text)
+            record_node = root.find("e:System/e:EventRecordID", _EVENT_NS)
+            record_id = int(record_node.text) if record_node is not None else 0
+            data = {
+                node.get("Name"): (node.text or "")
+                for node in root.findall(".//e:Data", _EVENT_NS)
+            }
+            return data.get("param5") or "", record_id
+        except Exception:
+            continue
+    return None, 0
+
+
+def _is_restart_reason(text):
+    lowered = text.lower()
+    return (
+        "重启" in text
+        or "重新启动" in text
+        or "restart" in lowered
+        or "reboot" in lowered
+    )
+
+
+def _is_shutdown_reason(text):
+    lowered = text.lower()
+    return (
+        "关闭电源" in text
+        or "关机" in text
+        or "shutdown" in lowered
+        or "shut down" in lowered
+        or "power off" in lowered
+        or "poweroff" in lowered
+    )
+
+
 class ShutdownHook:
     """拦截 WM_ENDSESSION，在 Qt 退出进程前关闭显示器"""
 
@@ -71,6 +137,12 @@ class ShutdownHook:
         self._hwnd = 0
         self._old_proc = 0
         self._proc_cb = None
+
+        # 用 EventRecordID 判断 1074 是否是本次会话产生的新事件，
+        # 避免把上一次关机/重启的记录误当成当前动作。
+        _, self._last_1074_id = _query_latest_1074()
+        self._pending_reason = None
+        self._pending_record_id = 0
 
     def start(self):
         if not self._enabled:
@@ -137,18 +209,93 @@ class ShutdownHook:
             self._log.warning(f"卸载关机关屏钩子失败: {e}")
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
-        if msg == WM_ENDSESSION and wparam:
-            self._handle_session_end()
+        if msg == WM_QUERYENDSESSION:
+            # 1074 通常在这时已经写入；先缓存，避免 WM_ENDSESSION 时
+            # 事件日志服务已经停止。
+            self._capture_shutdown_reason(lparam)
+        elif msg == WM_ENDSESSION:
+            if wparam:
+                self._handle_session_end(lparam)
+            else:
+                self._pending_reason = None
+                self._pending_record_id = 0
         return _CallWindowProcW(
             self._old_proc, hwnd, msg, wparam, lparam)
 
-    def _handle_session_end(self):
+    def _capture_shutdown_reason(self, lparam):
         try:
-            if not _GetSystemMetrics(SM_SHUTTINGDOWN):
-                self._log.info("会话结束但非系统关机（注销），跳过关屏")
+            if lparam & ENDSESSION_LOGOFF:
+                self._pending_reason = "logoff"
+                self._pending_record_id = 0
                 return
-            self._log.info("检测到系统关机/重启，正在关闭显示器...")
+
+            # 1074 由 User32 在关机发起时写入，但实测事件日志有约
+            # 1 秒缓冲；在 WM_QUERYENDSESSION 阶段重试 2 秒，避免到
+            # WM_ENDSESSION 时事件日志服务已经停止。
+            reason = None
+            record_id = 0
+            for _ in range(20):
+                reason, record_id = _query_latest_1074()
+                if reason is not None and record_id > self._last_1074_id:
+                    self._pending_reason = reason
+                    self._pending_record_id = record_id
+                    self._log.info(
+                        f"检测到会话结束请求: {reason} (event {record_id})")
+                    return
+                time.sleep(0.1)
+
+            self._log.info(
+                f"WM_QUERYENDSESSION 未找到新 1074 "
+                f"(latest={reason!r}, id={record_id}, "
+                f"baseline={self._last_1074_id})")
+        except Exception as e:
+            self._log.warning(f"读取 1074 事件失败: {e}")
+
+    def _handle_session_end(self, lparam):
+        try:
+            # 注销时 lParam 带 ENDSESSION_LOGOFF；部分系统上此时
+            # SM_SHUTTINGDOWN 也会非零，所以必须先看这个标志。
+            if lparam & ENDSESSION_LOGOFF:
+                self._log.info("检测到用户注销，跳过关屏")
+                return
+            if not _GetSystemMetrics(SM_SHUTTINGDOWN):
+                self._log.info("会话结束但非系统关机，跳过关屏")
+                return
+
+            reason = None
+            record_id = 0
+            if (self._pending_reason
+                    and self._pending_record_id > self._last_1074_id):
+                reason = self._pending_reason
+                record_id = self._pending_record_id
+            else:
+                for _ in range(10):
+                    reason, record_id = _query_latest_1074()
+                    if reason is not None and record_id > self._last_1074_id:
+                        break
+                    time.sleep(0.1)
+
+            if reason is None or record_id <= self._last_1074_id:
+                self._log.info(
+                    f"未找到本次关机动作类型 "
+                    f"(latest={reason!r}, id={record_id}, "
+                    f"baseline={self._last_1074_id})，跳过关屏")
+                return
+
+            self._last_1074_id = record_id
+
+            if _is_restart_reason(reason):
+                self._log.info(f"检测到重启 ({reason})，跳过关屏")
+                return
+            if not _is_shutdown_reason(reason):
+                self._log.info(f"未识别的关机类型 ({reason})，跳过关屏")
+                return
+
+            self._log.info(f"检测到关机 ({reason})，正在关闭显示器...")
             ok, total = ddcci.set_all_power(ddcci.POWER_OFF)
             self._log.info(f"显示器软关机指令完成: {ok}/{total} 台成功")
         except Exception as e:
             self._log.error(f"关机关屏处理失败: {e}")
+        finally:
+            self._pending_reason = None
+            self._pending_record_id = 0
