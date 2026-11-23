@@ -160,12 +160,13 @@ class BrightnessPlugin(Plugin):
 
     def _hotkey_up(self):
         # 在 GUI 线程执行，避免插件停止后访问已销毁的浮窗。
+        # 同时弹出滑块，让用户看到调节结果
         if self._flyout is not None:
-            self._flyout.brightness_up()
+            self._flyout.show_with_adjust(10)
 
     def _hotkey_down(self):
         if self._flyout is not None:
-            self._flyout.brightness_down()
+            self._flyout.show_with_adjust(-10)
 
     def on_config_change(self, new_config):
         self._config = new_config

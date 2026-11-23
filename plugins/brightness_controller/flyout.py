@@ -289,6 +289,10 @@ class BrightnessFlyout(QWidget):
         self._setting_values = False
         self._debounce_timers = {}
         self._pending = {}
+        # 热键发起显示时携带的调节步长，由 _on_monitors 消费后置空
+        self._hotkey_delta = None
+        # destroy() 之后 C++ 对象已回收，任何清理动作都必须直接跳过
+        self._destroyed = False
 
         self._title_label = None
         self._chevron = None
@@ -308,9 +312,25 @@ class BrightnessFlyout(QWidget):
     # ---- 显示 / 枚举 ----
 
     def show(self):
+        self._show_impl()
+
+    def show_with_adjust(self, delta):
+        """热键入口：弹出浮窗，并对鼠标所在显示器调节 delta。
+
+        窗口已显示时只复用现有 UI 并重置自动关闭定时器，绝不重建控件：
+        否则连续按热键会不断 enumerate + 新建控件，每次 _build_ui 都
+        再挂一条 _auto_timer，定时器链会越积越多。
+        """
+        self._show_impl(delta)
+
+    def _show_impl(self, hotkey_delta=None):
         if self.isVisible():
             self.raise_()
-            self.activateWindow()
+            if hotkey_delta is not None:
+                # 热键调节时不抢焦点，否则会打断用户正在进行的全屏操作
+                self._adjust_brightness(hotkey_delta)
+            else:
+                self.activateWindow()
             self._schedule()
             return
 
@@ -321,6 +341,7 @@ class BrightnessFlyout(QWidget):
         generation = self._generation
         self._show_target = cursor_monitor()
         self._expanded = False
+        self._hotkey_delta = hotkey_delta
 
         enumerate_monitors_async(
             lambda monitors: self.app.schedule_ui(
@@ -333,6 +354,9 @@ class BrightnessFlyout(QWidget):
             cleanup(monitors)
             return
         self._monitors = monitors
+        # 取出并立即消费，避免枚举失败时残留到下一次 show 误触发调节
+        hotkey_delta = self._hotkey_delta
+        self._hotkey_delta = None
         if not self._monitors:
             return
 
@@ -342,9 +366,11 @@ class BrightnessFlyout(QWidget):
              if m.hmonitor == self._show_target),
             self._monitors[0],
         )
-        self._build_ui()
+        self._build_ui(activate=hotkey_delta is None)
+        if hotkey_delta is not None:
+            self._adjust_brightness(hotkey_delta)
 
-    def _build_ui(self):
+    def _build_ui(self, activate=True):
         self._clear_ui()
 
         header = self._build_header()
@@ -364,8 +390,9 @@ class BrightnessFlyout(QWidget):
         self._resize_to_content()
         super().show()
         self.raise_()
-        self.activateWindow()
-        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        if activate:
+            self.activateWindow()
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
         self._schedule()
         self._prev_mouse = bool(
             ctypes.windll.user32.GetAsyncKeyState(1) & 0x8000)
@@ -570,7 +597,9 @@ class BrightnessFlyout(QWidget):
         layout.addSpacing(6)
         layout.addStretch(1)
 
-        current = get_brightness(self._selected)
+        # 枚举时刚读过一次亮度，直接用缓存值，省掉一次同步 DDC 读，
+        # 让热键弹出浮窗时更快出现
+        current = self._selected.current
 
         self._value_label = QLabel(str(current), body)
         self._value_label.setFixedWidth(VALUE_W)
@@ -642,10 +671,10 @@ class BrightnessFlyout(QWidget):
     # ---- 热键：只调鼠标所在显示器 ----
 
     def brightness_up(self):
-        self._adjust_brightness(10)
+        self.show_with_adjust(10)
 
     def brightness_down(self):
-        self._adjust_brightness(-10)
+        self.show_with_adjust(-10)
 
     def _adjust_brightness(self, delta):
         # 在按键当下取一次 HMONITOR，避免异步枚举期间鼠标移动改变目标。
@@ -707,6 +736,10 @@ class BrightnessFlyout(QWidget):
                     break
         finally:
             self._setting_values = False
+
+        # DDC 写入回执有延迟，结果回来时可能已接近自动关闭时间，
+        # 重置一次让用户能看到最终亮度
+        self._schedule()
 
     # ---- 定位 / 自动关闭 ----
 
@@ -808,20 +841,47 @@ class BrightnessFlyout(QWidget):
         self._debounce_timers.clear()
         self._pending.clear()
 
+    def _stop_timers(self):
+        """停掉本窗口持有的全部定时器。
+
+        _close() 只 hide 窗口，对象仍然存活，定时器若还在跑，timeout
+        会继续往已隐藏的窗口上派发。集中收口，避免以后新增定时器时
+        漏掉某一条清理路径。
+
+        destroy() 之后 C++ 对象可能已被回收，此时再访问会抛
+        RuntimeError，直接忽略即可。
+        """
+        try:
+            self._auto_timer.stop()
+            self._outside_timer.stop()
+        except RuntimeError:
+            return
+        for timer in list(self._debounce_timers.values()):
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
     def _close(self):
-        self._generation += 1
-        self._auto_timer.stop()
-        self._outside_timer.stop()
+        if self._destroyed:
+            return
+        try:
+            self._generation += 1
+            self._stop_timers()
+            self._hotkey_delta = None
 
-        pending = self._take_pending()
-        monitors = self._monitors
-        self._monitors = []
-        self._titles = []
-        self._selected = None
-        self._expanded = False
+            pending = self._take_pending()
+            monitors = self._monitors
+            self._monitors = []
+            self._titles = []
+            self._selected = None
+            self._expanded = False
 
-        self._clear_ui()
-        self.hide()
+            self._clear_ui()
+            self.hide()
+        except RuntimeError:
+            # C++ 对象已被回收（重复销毁），剩余句柄交给进程退出回收
+            return
 
         if pending or monitors:
             def _worker():
@@ -839,7 +899,13 @@ class BrightnessFlyout(QWidget):
 
     def destroy(self):
         self._close()
-        self.deleteLater()
+        if self._destroyed:
+            return
+        self._destroyed = True
+        try:
+            self.deleteLater()
+        except RuntimeError:
+            pass
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -853,5 +919,8 @@ class BrightnessFlyout(QWidget):
         event.accept()
 
     def hideEvent(self, event):
-        self._outside_timer.stop()
+        try:
+            self._outside_timer.stop()
+        except RuntimeError:
+            pass
         super().hideEvent(event)
