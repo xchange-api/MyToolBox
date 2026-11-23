@@ -7,6 +7,7 @@ DDC/CI 显示器亮度控制模块
 import ctypes
 import threading
 import time
+import winreg
 from ctypes import wintypes, Structure, POINTER, byref
 
 
@@ -25,14 +26,48 @@ class PHYSICAL_MONITOR(Structure):
     ]
 
 
+class MONITORINFOEXW(Structure):
+    r"""Win32 MONITORINFOEXW 结构体，用于读取显示器设备名（如 \\.\DISPLAY1）"""
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+class POINT(Structure):
+    """Win32 POINT 结构体"""
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class DISPLAY_DEVICEW(Structure):
+    """Win32 DISPLAY_DEVICEW 结构体，用于从设备名反查显示器 PnP ID"""
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("DeviceName", wintypes.WCHAR * 32),
+        ("DeviceString", wintypes.WCHAR * 128),
+        ("StateFlags", wintypes.DWORD),
+        ("DeviceID", wintypes.WCHAR * 128),
+        ("DeviceKey", wintypes.WCHAR * 128),
+    ]
+
+
 class MonitorInfo:
     """封装单个显示器的句柄、名称和亮度范围"""
-    __slots__ = ("hmonitor", "handle", "name", "_min", "_max", "_current")
+    __slots__ = (
+        "hmonitor", "handle", "name", "device", "friendly",
+        "_min", "_max", "_current",
+    )
 
-    def __init__(self, hmonitor, handle, name, min_v, max_v, current):
+    def __init__(self, hmonitor, handle, name, min_v, max_v, current,
+                 device="", friendly=""):
         self.hmonitor = hmonitor     # HMONITOR 句柄
         self.handle = handle         # 物理显示器句柄
-        self.name = name.strip("\x00").strip()  # 显示器名称
+        self.name = name.strip("\x00").strip()  # DDC 返回的名称，常为 Generic PnP Monitor
+        self.device = device.strip("\x00").strip()  # 设备名，如 \\.\DISPLAY1
+        self.friendly = friendly.strip()  # EDID 中的真实型号，如 LG ULTRAWIDE
         self._min = min_v
         self._max = max_v
         self._current = current
@@ -128,6 +163,122 @@ _enum_callback = _MonitorEnumProc(_enum_proc)
 _thread_local = threading.local()
 
 
+# ---- 鼠标所在显示器 ----
+
+_MONITOR_DEFAULTTONEAREST = 2
+
+_GetCursorPos = ctypes.windll.user32.GetCursorPos
+_GetCursorPos.argtypes = [POINTER(POINT)]
+_GetCursorPos.restype = wintypes.BOOL
+
+_MonitorFromPoint = ctypes.windll.user32.MonitorFromPoint
+_MonitorFromPoint.argtypes = [POINT, wintypes.DWORD]
+_MonitorFromPoint.restype = wintypes.HMONITOR
+
+_GetMonitorInfoW = ctypes.windll.user32.GetMonitorInfoW
+_GetMonitorInfoW.argtypes = [wintypes.HMONITOR, POINTER(MONITORINFOEXW)]
+_GetMonitorInfoW.restype = wintypes.BOOL
+
+_EnumDisplayDevicesW = ctypes.windll.user32.EnumDisplayDevicesW
+_EnumDisplayDevicesW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    POINTER(DISPLAY_DEVICEW),
+    wintypes.DWORD,
+]
+_EnumDisplayDevicesW.restype = wintypes.BOOL
+
+
+def cursor_monitor():
+    """返回鼠标当前所在显示器的 HMONITOR（按最近原则），失败返回 0"""
+    pt = POINT()
+    if not _GetCursorPos(byref(pt)):
+        return 0
+    return _MonitorFromPoint(pt, _MONITOR_DEFAULTTONEAREST)
+
+
+def get_device_name(hmonitor):
+    r"""读取 HMONITOR 对应的设备名（如 \\.\DISPLAY1）"""
+    info = MONITORINFOEXW()
+    info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+    if _GetMonitorInfoW(hmonitor, byref(info)):
+        return info.szDevice.strip("\x00").strip()
+    return ""
+
+
+# ---- 从 EDID 读取显示器真实型号 ----
+
+_edid_name_cache = {}
+
+
+def _parse_edid_name(edid):
+    """解析 EDID 的 0xFC 描述块，返回型号名（如 LG ULTRAWIDE）"""
+    for offset in range(54, 126, 18):
+        block = edid[offset:offset + 18]
+        if len(block) < 18:
+            break
+        if block[0:2] != b"\x00\x00" or block[2] != 0 or block[3] != 0xFC:
+            continue
+        raw = block[5:18].split(b"\x0a")[0]
+        return raw.decode("ascii", "ignore").strip()
+    return ""
+
+
+def _pnp_id_from_device(device_name):
+    r"""由 \\.\DISPLAY1 得到 MONITOR\\GSM59F1\\... 中的 GSM59F1"""
+    info = DISPLAY_DEVICEW()
+    info.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+    if not _EnumDisplayDevicesW(device_name, 0, byref(info), 0):
+        return ""
+    parts = info.DeviceID.strip("\x00").strip().split("\\")
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _edid_friendly_name(pnp_id):
+    """在注册表 Enum\\DISPLAY\\<PnP ID> 下找到 EDID 并解析型号名"""
+    if not pnp_id:
+        return ""
+    if pnp_id in _edid_name_cache:
+        return _edid_name_cache[pnp_id]
+
+    name = ""
+    try:
+        root = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            f"SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\{pnp_id}",
+        )
+    except OSError:
+        _edid_name_cache[pnp_id] = ""
+        return ""
+
+    with root:
+        index = 0
+        while not name:
+            try:
+                subkey = winreg.EnumKey(root, index)
+            except OSError:
+                break
+            index += 1
+            try:
+                with winreg.OpenKey(
+                        root, subkey + "\\Device Parameters") as params:
+                    edid, _ = winreg.QueryValueEx(params, "EDID")
+            except OSError:
+                continue
+            name = _parse_edid_name(edid)
+
+    _edid_name_cache[pnp_id] = name
+    return name
+
+
+def get_friendly_name(device_name):
+    """读取显示器真实型号，失败返回空字符串"""
+    try:
+        return _edid_friendly_name(_pnp_id_from_device(device_name))
+    except Exception:
+        return ""
+
+
 def _get_monitor_handles():
     """获取所有显示器的 HMONITOR 句柄列表"""
     _thread_local.enum_list = []
@@ -155,6 +306,8 @@ def enumerate_monitors():
         if not _GetPhysicalMonitorsFromHMONITOR(hmon, count.value, arr):
             continue
 
+        device = get_device_name(hmon)
+        friendly = get_friendly_name(device)
         for i in range(count.value):
             pm = arr[i]
             min_v = wintypes.DWORD(0)
@@ -169,6 +322,8 @@ def enumerate_monitors():
                     min_v.value,
                     max_v.value,
                     cur_v.value,
+                    device,
+                    friendly,
                 ))
     return result
 

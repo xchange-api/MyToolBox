@@ -31,7 +31,7 @@ def _get_icon_path():
 class BrightnessPlugin(Plugin):
     name = "brightness_controller"
     display_name = "亮度控制"
-    description = "DDC/CI 显示器亮度调节，左键单击太阳图标弹出滑块，Ctrl+Alt+↑/↓ 调节亮度，可选 Windows 关机时软关显示器"
+    description = "DDC/CI 显示器亮度调节，点击托盘图标选择显示器并调节亮度，Ctrl+Alt+↑/↓ 调节鼠标所在显示器，可选 Windows 关机时软关显示器"
     category = "系统工具"
     needs_admin = False
     default_config = {
