@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
-"""
-DDC/CI 显示器亮度控制模块
-基于 Windows dxva2.dll / gdi32.dll 实现物理显示器亮度读写
+"""DDC/CI 显示器亮度控制。
+
+基于 ``dxva2.dll``（回退 ``gdi32.dll``）通过 VCP 通道读写物理显示器
+的亮度与电源状态，并用注册表里的 EDID 解析出显示器真实型号。
+
+主要出口：
+    * ``enumerate_monitors()`` —— 枚举支持亮度控制的显示器；
+    * ``get_brightness()`` / ``set_brightness()`` —— 读写亮度；
+    * ``set_all_power()`` —— 批量下发 VCP 0xD6 电源指令；
+    * ``*_async()`` —— 上述操作的线程包装，供 GUI 线程调用。
+
+注意：``MonitorInfo`` 里持有 ``DestroyPhysicalMonitor`` 才能释放的句柄，
+用完必须交给 ``cleanup()``。
 """
 
 import ctypes
@@ -55,7 +65,17 @@ class DISPLAY_DEVICEW(Structure):
 
 
 class MonitorInfo:
-    """封装单个显示器的句柄、名称和亮度范围"""
+    """封装单个显示器的句柄、名称和亮度范围。
+
+    属性：
+        hmonitor: ``HMONITOR``，用于和鼠标所在显示器做匹配。
+        handle: ``GetPhysicalMonitorsFromHMONITOR`` 返回的物理显示器句柄，
+            必须由 ``_DestroyPhysicalMonitor`` 释放。
+        name: DDC 返回的描述名，通常是 "Generic PnP Monitor"。
+        device: 设备名，如 ``\\\\.\\DISPLAY1``。
+        friendly: 从 EDID 解析出的真实型号，取不到时为空串。
+    """
+
     __slots__ = (
         "hmonitor", "handle", "name", "device", "friendly",
         "_min", "_max", "_current",
@@ -74,6 +94,7 @@ class MonitorInfo:
 
     @property
     def current(self):
+        """最近一次读到的亮度值（枚举时即已填充）。"""
         return self._current
 
     @current.setter
@@ -82,6 +103,7 @@ class MonitorInfo:
 
     @property
     def range(self):
+        """返回 ``(最小亮度, 最大亮度)``。"""
         return self._min, self._max
 
 
@@ -288,7 +310,16 @@ def _get_monitor_handles():
 
 
 def enumerate_monitors():
-    """遍历所有显示器，返回支持 DDC/CI 的 MonitorInfo 列表"""
+    """遍历所有显示器，返回支持 DDC/CI 亮度控制的条目。
+
+    Returns:
+        ``MonitorInfo`` 列表。每个元素都持有需要 ``cleanup()`` 释放的
+        物理显示器句柄。枚举失败时返回空列表。
+
+    Note:
+        ``_GetMonitorBrightness`` 失败的分支没有调用
+        ``_DestroyPhysicalMonitor``，句柄会泄漏（审计报告 P1-7）。
+    """
     try:
         hmonitors = _get_monitor_handles()
     except Exception:
@@ -413,5 +444,10 @@ def enumerate_monitors_async(callback):
 
 
 def set_brightness_async(monitor, value):
-    """在后台线程设置显示器亮度"""
+    """在后台线程设置显示器亮度。
+
+    Note:
+        每次调用都新起线程且没有串行化，连续调用时多个线程可能并发进入
+        DDC 通道，导致最终亮度与最后一次请求不一致（审计报告 P1-10）。
+    """
     threading.Thread(target=set_brightness, args=(monitor, value), daemon=True).start()

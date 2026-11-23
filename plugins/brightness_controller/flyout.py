@@ -1,3 +1,17 @@
+"""亮度调节浮窗。
+
+布局参考 Windows 10 音量面板：折叠时只有一行标题加一条滑块，点击标题
+展开显示器列表。窗口跟随鼠标所在显示器，失焦/超时/点击外部自动关闭。
+
+三个入口：
+    * ``show()`` —— 托盘图标点击，重新枚举显示器并重建界面；
+    * ``show_with_adjust(delta)`` —— 全局热键，弹出并调节鼠标所在显示器；
+    * ``brightness_up()`` / ``brightness_down()`` —— ``show_with_adjust``
+      的具名包装。
+
+所有方法都必须在 Qt GUI 线程调用。
+"""
+
 import ctypes
 import math
 import re
@@ -18,6 +32,7 @@ from plugins.brightness_controller.ddcci import (
     cleanup, enumerate_monitors_async,
 )
 
+# 配色
 BG = "#3C3C3C"
 FG = "#ffffff"
 SUN = "#ffc832"
@@ -25,11 +40,13 @@ TRACK = "#6b6b6b"
 SEP = "#2d2d2d"
 HOVER = "#4a4a4a"
 
+# 滑块几何参数
 TRACK_H = 1
 THUMB_W = 8
 THUMB_H = 24
 TRACK_INSET = 10
 
+# 布局尺寸
 FLYOUT_W = 360
 HEADER_H = 42
 SLIDER_AREA_H = 54
@@ -39,6 +56,7 @@ ICON_W = 24
 VALUE_W = 46
 ROW_H = 42
 SLIDER_W = 250
+# 无操作多久后自动关闭（毫秒）
 AUTO_MS = 2500
 
 SCROLL_QSS = """
@@ -59,6 +77,13 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
 
 
 def get_accent_color():
+    """读取 Windows 主题强调色。
+
+    依次尝试资源管理器 Accent 项、StartColor，最后退化到 DWM 的系统色。
+
+    Returns:
+        形如 ``#0078d4`` 的颜色字符串；全部失败时返回默认蓝。
+    """
     sources = [
         (r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", "AccentColor"),
         (r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", "StartColor"),
@@ -70,6 +95,7 @@ def get_accent_color():
                 val, _ = winreg.QueryValueEx(k, name)
             if val == 0 or val == 0xFFFFFFFF:
                 continue
+            # 注册表里是 ABGR 排列
             r = val & 0xFF
             g = (val >> 8) & 0xFF
             b = (val >> 16) & 0xFF
@@ -81,6 +107,7 @@ def get_accent_color():
         opaque = ctypes.c_int()
         if ctypes.windll.dwmapi.DwmGetColorizationColor(ctypes.byref(color), ctypes.byref(opaque)) == 0:
             v = color.value
+            # DWM 返回的是 ARGB
             r = (v >> 16) & 0xFF
             g = (v >> 8) & 0xFF
             b = v & 0xFF
@@ -91,6 +118,14 @@ def get_accent_color():
 
 
 def _make_sun_pixmap(size=20):
+    """画一个太阳图标，用于图标文件缺失时兜底。
+
+    Args:
+        size: 生成位图的边长（像素）。
+
+    Returns:
+        透明背景的 ``QPixmap``。
+    """
     pix = QPixmap(size, size)
     pix.fill(Qt.GlobalColor.transparent)
 
@@ -103,6 +138,7 @@ def _make_sun_pixmap(size=20):
     painter.setBrush(QColor(SUN))
     painter.drawEllipse(QPoint(int(cx), int(cy)), int(r), int(r))
 
+    # 8 条光芒，与水平线成 0/45/90/... 度
     painter.setPen(QPen(QColor(SUN), 1))
     for degree in range(0, 360, 45):
         rad = math.radians(degree)
@@ -120,7 +156,11 @@ def _make_sun_pixmap(size=20):
 
 
 class BrightnessSlider(QSlider):
-    """与旧版 Canvas 滑块行为对齐的 Qt 滑块。"""
+    """与旧版 Canvas 滑块行为对齐的 Qt 滑块。
+
+    完全自绘（不用 QSS），因此轨道、已填充段和滑块位置都由
+    ``paintEvent`` 计算；鼠标拖动时按 X 坐标反算 0~100 的值。
+    """
 
     def __init__(self, value=50, command=None, accent="#0078d4", parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
@@ -138,6 +178,7 @@ class BrightnessSlider(QSlider):
         self.valueChanged.connect(self._on_value_changed)
 
     def _value_from_x(self, x):
+        """把控件内的 X 坐标换算成 0~100 的亮度值。"""
         left = float(TRACK_INSET)
         right = self.width() - float(TRACK_INSET)
         if right <= left:
@@ -146,6 +187,7 @@ class BrightnessSlider(QSlider):
         return max(0, min(100, int(round(ratio * 100))))
 
     def paintEvent(self, event):
+        """绘制背景轨道、强调色填充段和圆形滑块。"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -189,6 +231,7 @@ class BrightnessSlider(QSlider):
         painter.end()
 
     def mousePressEvent(self, event):
+        """左键按下即跳转到点击位置，并进入拖动状态。"""
         if event.button() == Qt.MouseButton.LeftButton:
             self.setSliderDown(True)
             self.setValue(self._value_from_x(event.position().x()))
@@ -197,6 +240,7 @@ class BrightnessSlider(QSlider):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        """拖动过程中持续跟随鼠标 X 坐标。"""
         if self.isSliderDown():
             self.setValue(self._value_from_x(event.position().x()))
             event.accept()
@@ -204,6 +248,7 @@ class BrightnessSlider(QSlider):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        """松开左键时退出拖动状态。"""
         if event.button() == Qt.MouseButton.LeftButton:
             self.setSliderDown(False)
             event.accept()
@@ -211,17 +256,23 @@ class BrightnessSlider(QSlider):
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
+        """滚轮每格调整 5，方向与系统滚动方向一致。"""
         delta = 5 if event.angleDelta().y() > 0 else -5
         self.setValue(max(0, min(100, self.value() + delta)))
         event.accept()
 
     def _on_value_changed(self, value):
+        """值变化时回调外部命令（设置值时由 ``_setting_values`` 屏蔽）。"""
         if self._cmd:
             self._cmd(value)
 
 
 class ClickableRow(QWidget):
-    """可点击的行，带 Windows 风格的鼠标悬停高亮"""
+    """可点击的行，带 Windows 风格的鼠标悬停高亮。
+
+    子控件需要设置 ``WA_TransparentForMouseEvents``，否则点击会被
+    QLabel 吃掉而收不到 ``clicked``。
+    """
 
     clicked = Signal()
 
@@ -231,14 +282,17 @@ class ClickableRow(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def enterEvent(self, event):
+        """鼠标进入时重绘高亮背景。"""
         self.update()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        """鼠标离开时重绘去掉高亮。"""
         self.update()
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        """在自身范围内松开左键时发出 ``clicked``。"""
         if (event.button() == Qt.MouseButton.LeftButton
                 and self.rect().contains(event.position().toPoint())):
             self.clicked.emit()
@@ -247,6 +301,7 @@ class ClickableRow(QWidget):
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
+        """仅在悬停时填充一层浅色背景。"""
         if self.underMouse():
             painter = QPainter(self)
             painter.fillRect(self.rect(), QColor(HOVER))
@@ -312,6 +367,7 @@ class BrightnessFlyout(QWidget):
     # ---- 显示 / 枚举 ----
 
     def show(self):
+        """显示浮窗（托盘图标点击入口），会重新枚举显示器。"""
         self._show_impl()
 
     def show_with_adjust(self, delta):
@@ -324,6 +380,12 @@ class BrightnessFlyout(QWidget):
         self._show_impl(delta)
 
     def _show_impl(self, hotkey_delta=None):
+        """``show`` 与 ``show_with_adjust`` 的共同实现。
+
+        Args:
+            hotkey_delta: 非 ``None`` 表示由热键触发，需要在不抢焦点的
+                前提下弹出并调节；枚举完成后在 ``_on_monitors`` 里消费。
+        """
         if self.isVisible():
             self.raise_()
             if hotkey_delta is not None:
@@ -350,6 +412,13 @@ class BrightnessFlyout(QWidget):
         )
 
     def _on_monitors(self, generation, monitors):
+        """枚举结果回到主线程后构建界面。
+
+        Args:
+            generation: 发起枚举时记录的代次。与当前代次不符说明期间又有
+                新的显示请求，直接释放句柄并丢弃本次结果。
+            monitors: 后台线程枚举出的显示器列表。
+        """
         if generation != self._generation:
             cleanup(monitors)
             return
@@ -371,6 +440,12 @@ class BrightnessFlyout(QWidget):
             self._adjust_brightness(hotkey_delta)
 
     def _build_ui(self, activate=True):
+        """重建全部子控件并显示窗口。
+
+        Args:
+            activate: 是否抢焦点。热键触发时传 ``False``，避免打断用户
+                正在进行的全屏操作。
+        """
         self._clear_ui()
 
         header = self._build_header()
@@ -394,11 +469,14 @@ class BrightnessFlyout(QWidget):
             self.activateWindow()
             self.setFocus(Qt.FocusReason.OtherFocusReason)
         self._schedule()
+        # 记录此刻鼠标是否已按下，避免"打开窗口时正按着左键"被误判为
+        # 点击了窗口外部而立即关闭
         self._prev_mouse = bool(
             ctypes.windll.user32.GetAsyncKeyState(1) & 0x8000)
         self._outside_timer.start()
 
     def _resize_to_content(self):
+        """按当前是否展开列表计算窗口尺寸并重新定位。"""
         list_h = 0
         if self._expanded:
             visible = min(len(self._monitors), LIST_MAX_VISIBLE)
@@ -410,6 +488,10 @@ class BrightnessFlyout(QWidget):
     # ---- 顶部标题栏 ----
 
     def _build_header(self):
+        """构建顶部标题行：左侧显示器名，右侧展开箭头。
+
+        只有一台显示器时不注册点击、并隐藏箭头（没有可切换的目标）。
+        """
         header = ClickableRow(self)
         header.setFixedHeight(HEADER_H)
         if len(self._monitors) > 1:
@@ -444,6 +526,7 @@ class BrightnessFlyout(QWidget):
         return header
 
     def _update_header(self):
+        """刷新标题文字与箭头方向，过长时右侧省略。"""
         if self._title_label is None or self._selected is None:
             return
         if self._expanded:
@@ -458,6 +541,7 @@ class BrightnessFlyout(QWidget):
         self._chevron.setText("\uE70E" if self._expanded else "\uE70D")
 
     def _selected_title(self):
+        """返回当前选中显示器的标题，找不到时回退到 "显示器"。"""
         for i, monitor in enumerate(self._monitors):
             if monitor is self._selected and i < len(self._titles):
                 return self._titles[i]
@@ -466,6 +550,11 @@ class BrightnessFlyout(QWidget):
     # ---- 显示器选择列表 ----
 
     def _build_selector(self):
+        """构建可滚动的显示器选择列表。
+
+        超过 ``LIST_MAX_VISIBLE`` 台时出现竖向滚动条，容器高度固定为
+        可见行数，避免窗口被撑高。
+        """
         container = QWidget(self)
         visible = min(len(self._monitors), LIST_MAX_VISIBLE)
         container.setFixedHeight(visible * LIST_ITEM_H)
@@ -535,6 +624,10 @@ class BrightnessFlyout(QWidget):
         return container
 
     def _select_monitor(self, monitor):
+        """列表项被点击：切换到该显示器并收起列表。
+
+        点当前已选中的显示器只收起列表，不重复读亮度。
+        """
         if monitor is self._selected:
             self._set_expanded(False)
             self._schedule()
@@ -547,6 +640,12 @@ class BrightnessFlyout(QWidget):
         self._schedule()
 
     def _refresh_selection(self):
+        """把界面同步到当前选中显示器：重读亮度、更新勾选与标题。
+
+        Note:
+            ``get_brightness`` 是同步 DDC 读，会在 GUI 线程上阻塞几十毫秒
+            （审计报告 P1-9）。
+        """
         if self._selected is None or self._slider is None:
             return
 
@@ -563,11 +662,13 @@ class BrightnessFlyout(QWidget):
         self._update_header()
 
     def _toggle_expanded(self):
+        """点击标题行时展开/收起显示器列表。"""
         if len(self._monitors) <= 1:
             return
         self._set_expanded(not self._expanded)
 
     def _set_expanded(self, expanded):
+        """设置列表展开状态，联动尺寸与自动关闭计时。"""
         if expanded and len(self._monitors) <= 1:
             return
         if self._expanded == expanded:
@@ -582,6 +683,7 @@ class BrightnessFlyout(QWidget):
     # ---- 滑块 ----
 
     def _build_slider_row(self):
+        """构建底部滑块行：太阳图标、滑块、右侧数值。"""
         body = QWidget(self)
         body.setFixedHeight(SLIDER_AREA_H)
 
@@ -621,12 +723,17 @@ class BrightnessFlyout(QWidget):
         return body
 
     def _load_icon_pixmap(self):
+        """加载托盘图标作为滑块左侧装饰，失败时退回手绘太阳。"""
         pix = QIcon(self._icon_path).pixmap(20, 20)
         if pix.isNull():
             return _make_sun_pixmap(20)
         return pix
 
     def _on_slider_changed(self, value):
+        """滑块值变化：更新数字、重置自动关闭、排队写入硬件。
+
+        ``_setting_values`` 为真时说明是程序在同步界面，不应当作用户操作。
+        """
         if self._setting_values or self._selected is None:
             return
         self._value_label.setText(str(int(value)))
@@ -634,6 +741,11 @@ class BrightnessFlyout(QWidget):
         self._queue_brightness(self._selected, int(value))
 
     def _queue_brightness(self, monitor, value):
+        """记录待写入的亮度，并用 40ms 防抖合并连续拖动。
+
+        每台显示器一个独立计时器，键为 ``id(monitor)``；``_pending`` 里
+        只保留最后一次请求的值。
+        """
         key = id(monitor)
         self._pending[key] = (monitor, value)
 
@@ -647,6 +759,7 @@ class BrightnessFlyout(QWidget):
         timer.start()
 
     def _flush_brightness(self, key):
+        """防抖计时器到期，把该显示器最后一次请求的亮度写下去。"""
         item = self._pending.pop(key, None)
         if item is None:
             return
@@ -654,6 +767,7 @@ class BrightnessFlyout(QWidget):
         set_brightness_async(monitor, value)
 
     def _take_pending(self):
+        """取出并清空所有待写入项，同时停掉对应防抖计时器。"""
         pending = list(self._pending.values())
         self._pending.clear()
         for timer in self._debounce_timers.values():
@@ -661,6 +775,7 @@ class BrightnessFlyout(QWidget):
         return pending
 
     def _flush_pending_now(self):
+        """同步写入所有待写亮度，用于切换显示器或关窗前保证不丢请求。"""
         pending = self._take_pending()
         for monitor, value in pending:
             try:
@@ -671,12 +786,22 @@ class BrightnessFlyout(QWidget):
     # ---- 热键：只调鼠标所在显示器 ----
 
     def brightness_up(self):
+        """调亮一档（+10）并弹出浮窗。"""
         self.show_with_adjust(10)
 
     def brightness_down(self):
+        """调暗一档（-10）并弹出浮窗。"""
         self.show_with_adjust(-10)
 
     def _adjust_brightness(self, delta):
+        """按 ``delta`` 调节鼠标所在显示器。
+
+        Args:
+            delta: 亮度增量，正值调亮、负值调暗。
+
+        已有枚举结果时直接调节；否则先异步枚举，再由
+        ``_adjust_enumerated`` 接手。
+        """
         # 在按键当下取一次 HMONITOR，避免异步枚举期间鼠标移动改变目标。
         target = cursor_monitor()
         if self._monitors:
@@ -692,6 +817,13 @@ class BrightnessFlyout(QWidget):
         )
 
     def _adjust_enumerated(self, monitors, target, delta):
+        """枚举完成后执行调节，并在结束时释放这批临时句柄。
+
+        Args:
+            monitors: 新枚举出的显示器列表，用完即释放。
+            target: 按键当下记录的 ``HMONITOR``。
+            delta: 亮度增量。
+        """
         targets = [m for m in monitors if m.hmonitor == target]
         if not targets:
             cleanup(monitors)
@@ -699,6 +831,7 @@ class BrightnessFlyout(QWidget):
         self._do_adjust(targets, delta, cleanup_list=monitors)
 
     def _focus_monitor(self, monitor):
+        """把界面选中项切到指定显示器（窗口未显示时不做任何事）。"""
         if not self.isVisible() or monitor is self._selected:
             return
         self._flush_pending_now()
@@ -706,6 +839,19 @@ class BrightnessFlyout(QWidget):
         self._refresh_selection()
 
     def _do_adjust(self, targets, delta, cleanup_list=None):
+        """在后台线程读出当前亮度、加上增量后写回。
+
+        Args:
+            targets: 要调节的 ``MonitorInfo`` 列表（同一台显示器的多个
+                物理句柄）。
+            delta: 亮度增量。
+            cleanup_list: 需要在本轮结束后整体释放的句柄列表；为 ``None``
+                表示句柄归窗口所有，不在这里释放。
+
+        Note:
+            后台线程直接使用了 ``targets`` 里的句柄，与 GUI 线程的
+            ``_close()`` 之间没有同步（审计报告 P1-11）。
+        """
         def _worker():
             results = []
             for monitor in targets:
@@ -724,6 +870,12 @@ class BrightnessFlyout(QWidget):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _update_slider(self, results):
+        """把后台调节结果写回滑块与数值标签。
+
+        Args:
+            results: ``(monitor, value)`` 列表，``value`` 为 ``None``
+                表示该显示器调节失败。
+        """
         if self._selected is None or not self.isVisible():
             return
 
@@ -744,6 +896,11 @@ class BrightnessFlyout(QWidget):
     # ---- 定位 / 自动关闭 ----
 
     def _position(self, w, h):
+        """把窗口摆到鼠标所在显示器的可用区角落。
+
+        按任务栏位置避让：左侧任务栏贴左下，顶部任务栏贴右上，
+        其余情况贴右下。
+        """
         # 使用 QScreen 的逻辑坐标（Qt move() 也是逻辑像素），避免缩放屏错位。
         # 浮窗跟随鼠标所在显示器，而不是固定钉在主屏。
         screen = (
@@ -772,6 +929,10 @@ class BrightnessFlyout(QWidget):
         self.move(x, y)
 
     def _check_outside(self):
+        """每 50ms 轮询一次左键，检测"在窗口外按下"从而关闭浮窗。
+
+        用按下沿（从未按到按下）判断，避免按住左键拖动滑块时被误关。
+        """
         if not self.isVisible():
             self._outside_timer.stop()
             return
@@ -784,6 +945,7 @@ class BrightnessFlyout(QWidget):
         self._prev_mouse = pressed
 
     def _schedule(self):
+        """重置自动关闭倒计时；列表展开期间不启动计时。"""
         # 展开选择列表时暂停自动关闭，避免用户还没选就消失。
         if self._expanded:
             self._auto_timer.stop()
@@ -822,6 +984,7 @@ class BrightnessFlyout(QWidget):
         return result
 
     def _clear_ui(self):
+        """销毁所有子控件、防抖计时器与待写队列，为重建做准备。"""
         self._title_label = None
         self._chevron = None
         self._selector = None
@@ -863,6 +1026,11 @@ class BrightnessFlyout(QWidget):
                 pass
 
     def _close(self):
+        """停止定时器、隐藏窗口，并把剩余工作交后台线程收尾。
+
+        幂等：已销毁的实例直接返回；C++ 对象已被回收时静默跳过，
+        不再访问 ``_layout`` 等原生成员。
+        """
         if self._destroyed:
             return
         try:
@@ -895,9 +1063,11 @@ class BrightnessFlyout(QWidget):
             threading.Thread(target=_worker, daemon=True).start()
 
     def close(self):
+        """重写 ``QWidget.close``，统一走内部清理流程。"""
         self._close()
 
     def destroy(self):
+        """关闭窗口并安排对象销毁，可安全重复调用。"""
         self._close()
         if self._destroyed:
             return
@@ -908,6 +1078,7 @@ class BrightnessFlyout(QWidget):
             pass
 
     def keyPressEvent(self, event):
+        """按 Esc 关闭浮窗。"""
         if event.key() == Qt.Key.Key_Escape:
             self._close()
             event.accept()
@@ -915,10 +1086,12 @@ class BrightnessFlyout(QWidget):
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        """系统要求关闭窗口时执行同样的清理。"""
         self._close()
         event.accept()
 
     def hideEvent(self, event):
+        """窗口隐藏后停止外部点击轮询，省掉无意义的 50ms 定时器。"""
         try:
             self._outside_timer.stop()
         except RuntimeError:

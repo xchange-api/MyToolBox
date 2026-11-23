@@ -44,6 +44,7 @@ MOCK_DATA = [
 
 
 def make_monitors():
+    """按 ``MOCK_DATA`` 造一批假的 ``MonitorInfo``，供界面联调。"""
     return [
         MonitorInfo(
             i + 1, i + 1, "Generic PnP Monitor", 0, 100, value, device, name,
@@ -53,7 +54,11 @@ def make_monitors():
 
 
 class UiBridge(QObject):
-    """模拟 core.app.schedule_ui 的跨线程 UI 调度"""
+    """模拟 ``core.app.schedule_ui`` 的跨线程 UI 调度。
+
+    真实的 UiDispatcher 用 QueuedConnection 把回调送回 GUI 线程，这里
+    用同样的机制模拟，便于在没有 Core 的情况下跑浮窗。
+    """
 
     _sig = Signal(object)
 
@@ -62,9 +67,11 @@ class UiBridge(QObject):
         self._sig.connect(self._run, Qt.ConnectionType.QueuedConnection)
 
     def schedule_ui(self, fn):
+        """排队执行 ``fn``。"""
         self._sig.emit(fn)
 
     def _run(self, fn):
+        """槽函数，在 GUI 线程执行回调。"""
         fn()
 
 
@@ -135,6 +142,7 @@ def run_selftest(app, flyout):
 
 
 def main():
+    """启动 Mock：装好假数据后展示一个带托盘图标的浮窗。"""
     app = QApplication(sys.argv)
     app.setApplicationName("BrightnessMock")
     app.setQuitOnLastWindowClosed(False)
@@ -193,6 +201,7 @@ def main():
 
 
 def _icon_path():
+    """返回真实托盘图标路径，让 Mock 尽量接近真实外观。"""
     return os.path.join(
         ROOT, "plugins", "brightness_controller", "assets", "fluent.ico")
 

@@ -1,3 +1,9 @@
+"""系统托盘图标与菜单。
+
+全应用只有一个托盘图标，菜单内容由插件列表加上「开机自启」「退出」
+两个固定项构成。插件状态变化后调用 ``update_menu`` 刷新勾选状态。
+"""
+
 from PySide6.QtCore import QObject, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
@@ -6,6 +12,7 @@ from core.logger import get_logger
 
 
 def _create_default_icon():
+    """用 QPainter 现场画一个 64x64 的占位托盘图标。"""
     size = 64
     pix = QPixmap(size, size)
     pix.fill(Qt.GlobalColor.transparent)
@@ -28,6 +35,8 @@ def _create_default_icon():
 
 
 class TrayManager(QObject):
+    """托管托盘图标与右键菜单。"""
+
     def __init__(self, app_ref):
         super().__init__(app_ref)
         self._app = app_ref
@@ -42,12 +51,14 @@ class TrayManager(QObject):
         self._rebuild_menu()
 
     def start(self):
+        """显示托盘图标；系统不支持托盘时只记日志。"""
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self._log.warning("系统托盘不可用")
             return
         self._icon.show()
 
     def stop(self):
+        """隐藏并释放托盘图标与菜单。"""
         try:
             self._icon.hide()
             self._icon.setContextMenu(None)
@@ -60,9 +71,14 @@ class TrayManager(QObject):
             pass
 
     def update_menu(self):
+        """刷新菜单项的勾选状态。
+
+        插件列表在启动后不再变化，因此只需同步勾选，不必重建菜单。
+        """
         self._sync_checks()
 
     def _rebuild_menu(self):
+        """按「插件项 → 分隔符 → 开机自启 → 分隔符 → 退出」构建菜单。"""
         self._menu.clear()
         self._actions = {}
 
@@ -92,14 +108,17 @@ class TrayManager(QObject):
         self._menu.addAction(self._exit_action)
 
     def _sync_checks(self):
+        """把当前运行状态回写到各菜单项的勾选位。"""
         for name, action in self._actions.items():
             action.setChecked(self._is_active(name))
         if self._autostart_action is not None:
             self._autostart_action.setChecked(self._app.autostart_enabled)
 
     def _on_toggle(self, name):
+        """菜单项被点击时把请求转交应用层处理。"""
         self._app.toggle_plugin(name)
 
     def _is_active(self, name):
+        """插件是否处于运行中（含运行在独立 helper 进程里的插件）。"""
         return (name in self._app.active_plugins
                 or name in self._app.active_helper_plugins)

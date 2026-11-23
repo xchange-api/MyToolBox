@@ -103,6 +103,10 @@ def _query_latest_1074():
 
 
 def _is_restart_reason(text):
+    """判断 1074 事件的 param5 是否表示"重启"。
+
+    兼容中文（"重启"/"重新启动"）与英文（restart/reboot）系统的本地化文案。
+    """
     lowered = text.lower()
     return (
         "重启" in text
@@ -113,6 +117,10 @@ def _is_restart_reason(text):
 
 
 def _is_shutdown_reason(text):
+    """判断 1074 事件的 param5 是否表示"关机"。
+
+    注意"关机"是"关闭电源"的子串，两条都要保留以覆盖不同系统的措辞。
+    """
     lowered = text.lower()
     return (
         "关闭电源" in text
@@ -125,7 +133,12 @@ def _is_shutdown_reason(text):
 
 
 class ShutdownHook:
-    """拦截 WM_ENDSESSION，在 Qt 退出进程前关闭显示器"""
+    """拦截 WM_ENDSESSION，在 Qt 退出进程前关闭显示器。
+
+    Args:
+        app: 提供 ``native_window`` 的应用对象，子类化作用在该隐藏窗口上。
+        enabled: 是否启用；为 ``False`` 时 ``start()`` 直接返回。
+    """
 
     def __init__(self, app, enabled=True):
         self._window = app.native_window
@@ -145,6 +158,7 @@ class ShutdownHook:
         self._pending_record_id = 0
 
     def start(self):
+        """启用并安装窗口过程钩子。"""
         if not self._enabled:
             self._log.info("关机关屏功能未启用 (power_off_on_shutdown=false)")
             return
@@ -153,13 +167,20 @@ class ShutdownHook:
         self._install_wndproc()
 
     def stop(self):
+        """停用并还原原始窗口过程。"""
         self._started = False
         self._uninstall_wndproc()
 
     def is_active(self):
+        """返回是否处于启用状态。"""
         return self._started
 
     def _install_wndproc(self):
+        """把隐藏窗口的 WndProc 换成 ``self._wndproc``。
+
+        原生句柄尚未创建时（Qt 还没实例化窗口）安排 200ms 后重试，
+        最多 50 次（约 10 秒）。
+        """
         if not self._started:
             return
         try:
@@ -188,6 +209,7 @@ class ShutdownHook:
             self._log.error(f"安装关机关屏钩子失败: {e}")
 
     def _retry_install(self, reason):
+        """稍后重试安装，超过次数上限后放弃。"""
         self._install_retries += 1
         if self._install_retries < 50:
             self._log.debug(f"{reason}，稍后重试")
@@ -196,6 +218,7 @@ class ShutdownHook:
         self._log.error(f"{reason}，关机关屏功能停用")
 
     def _uninstall_wndproc(self):
+        """把窗口过程还原成安装前保存的地址。"""
         if not self._installed:
             return
         try:
@@ -209,6 +232,11 @@ class ShutdownHook:
             self._log.warning(f"卸载关机关屏钩子失败: {e}")
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
+        """替换后的窗口过程。
+
+        只关心会话结束相关的两条消息，其余原样透传给 Qt 的窗口过程。
+        ``WM_ENDSESSION`` 的 ``wparam`` 为 0 表示会话结束被取消。
+        """
         if msg == WM_QUERYENDSESSION:
             # 1074 通常在这时已经写入；先缓存，避免 WM_ENDSESSION 时
             # 事件日志服务已经停止。
@@ -223,6 +251,16 @@ class ShutdownHook:
             self._old_proc, hwnd, msg, wparam, lparam)
 
     def _capture_shutdown_reason(self, lparam):
+        """在 ``WM_QUERYENDSESSION`` 阶段抓住本次关机的原因。
+
+        Args:
+            lparam: 会话结束标志，带 ``ENDSESSION_LOGOFF`` 时表示注销。
+
+        Note:
+            这里会阻塞最多 2 秒轮询事件日志，而 ``WM_QUERYENDSESSION``
+            的超时窗口有限，过长会让系统提示"应用阻止关机"
+            （审计报告 P2-2）。
+        """
         try:
             if lparam & ENDSESSION_LOGOFF:
                 self._pending_reason = "logoff"
@@ -252,6 +290,11 @@ class ShutdownHook:
             self._log.warning(f"读取 1074 事件失败: {e}")
 
     def _handle_session_end(self, lparam):
+        """确认是"关机"（而非注销/重启）后关闭所有显示器。
+
+        依次排除：用户注销、非系统关机、重启、无法识别的关机类型。
+        只有确认为关机时才发送 VCP 0xD6=4。
+        """
         try:
             # 注销时 lParam 带 ENDSESSION_LOGOFF；部分系统上此时
             # SM_SHUTTINGDOWN 也会非零，所以必须先看这个标志。
