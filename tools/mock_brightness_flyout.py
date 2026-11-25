@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """多显示器亮度浮窗的本地 Mock。
 
-用途：没有第二台显示器时验证“选择显示器”浮窗的布局和交互。
+用途：没有多台显示器/笔记本内置屏时验证“选择显示器”浮窗的布局和交互。
 它只替换显示器枚举与读写函数，界面用的是真实的 BrightnessFlyout。
 
 运行:
@@ -11,6 +11,9 @@
 正常模式会在托盘放一个带红点的太阳图标：
     - 左键点击：显示亮度浮窗
     - 右键菜单：显示浮窗 / 重置亮度 / 退出 Mock
+
+Mock 里共有 6 台外接屏 + 1 台 WMI 内置屏，列表超过 5 项会自动出现
+滚动条，可以顺带验证滚动和“内置显示器”标题。
 """
 
 import os
@@ -42,15 +45,32 @@ MOCK_DATA = [
     ("", r"\\.\DISPLAY6", 70),  # 模拟 EDID 读不到型号的显示器
 ]
 
+INTERNAL_DEVICE = r"\\.\DISPLAY7"
+INTERNAL_VALUE = 45
+
 
 def make_monitors():
     """按 ``MOCK_DATA`` 造一批假的 ``MonitorInfo``，供界面联调。"""
-    return [
+    monitors = [
         MonitorInfo(
             i + 1, i + 1, "Generic PnP Monitor", 0, 100, value, device, name,
         )
         for i, (name, device, value) in enumerate(MOCK_DATA)
     ]
+    # 模拟笔记本内置屏：没有 DDC 句柄，走 WMI
+    monitors.append(MonitorInfo(
+        len(MOCK_DATA) + 1,
+        None,
+        "内置显示器 (WMI)",
+        0,
+        100,
+        INTERNAL_VALUE,
+        INTERNAL_DEVICE,
+        "LP140QH2",
+        source="wmi",
+        instance=r"DISPLAY\MOCK1234\4&0&UID4352_0",
+    ))
+    return monitors
 
 
 class UiBridge(QObject):
@@ -119,12 +139,16 @@ def run_selftest(app, flyout):
     def check():
         print("monitors =", len(flyout._monitors))
         print("titles =", flyout._titles)
-        print("selected =", flyout._selected.friendly or "(fallback)")
+        print("selected =", flyout._selected_title())
         print("collapsed size =", flyout.width(), flyout.height())
         flyout._set_expanded(True)
         print("expanded size =", flyout.width(), flyout.height())
         flyout._select_monitor(flyout._monitors[1])
-        print("after select =", flyout._selected.friendly,
+        print("after select =", flyout._selected_title(),
+              "value =", flyout._value_label.text())
+        flyout._set_expanded(True)
+        flyout._select_monitor(flyout._monitors[-1])
+        print("internal =", flyout._selected_title(),
               "value =", flyout._value_label.text())
 
         flyout._set_expanded(True)
@@ -158,7 +182,7 @@ def main():
         return app.exec()
 
     tray = QSystemTrayIcon(mock_icon(), app)
-    tray.setToolTip("亮度浮窗 Mock（6 台模拟显示器）")
+    tray.setToolTip("亮度浮窗 Mock（6 台模拟显示器 + 内置屏）")
 
     menu = QMenu()
     show_action = menu.addAction("显示亮度浮窗")
@@ -169,6 +193,7 @@ def main():
     def reset():
         for i, (_, _, value) in enumerate(MOCK_DATA):
             monitors[i].current = value
+        monitors[-1].current = INTERNAL_VALUE
         flyout._close()
         flyout.show()
 

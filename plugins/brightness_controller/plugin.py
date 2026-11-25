@@ -46,7 +46,7 @@ class BrightnessPlugin(Plugin):
 
     name = "brightness_controller"
     display_name = "亮度控制"
-    description = "DDC/CI 显示器亮度调节，点击托盘图标选择显示器并调节亮度，Ctrl+Alt+↑/↓ 调节鼠标所在显示器，可选 Windows 关机时软关显示器"
+    description = "外接屏 DDC/CI + 笔记本内置屏 WMI 亮度调节，点击托盘图标选择显示器并调节亮度，Ctrl+Alt+↑/↓ 调节鼠标所在显示器，可选 Windows 关机时软关显示器"
     category = "系统工具"
     needs_admin = False
     default_config = {
@@ -91,8 +91,24 @@ class BrightnessPlugin(Plugin):
         self._icon.show()
 
         self._start_hotkey()
+        self._warm_wmi()
         if bool(self._config.get("power_off_on_shutdown", False)):
             self._start_shutdown_hook()
+
+    def _warm_wmi(self):
+        """后台预热 WMI。
+
+        首次查询要初始化 COM 并连接 WMI 服务，台式机上大约 0.5 秒；
+        放到启动后的后台线程里，避免第一次弹浮窗时明显变慢。
+        """
+        def _worker():
+            try:
+                from plugins.brightness_controller import wmi_brightness
+                wmi_brightness.enumerate_monitors()
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_icon_activated(self, reason):
         """托盘图标被左键单击时弹出浮窗。"""

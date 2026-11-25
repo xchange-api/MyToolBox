@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
-"""DDC/CI 显示器亮度控制。
+"""显示器亮度控制（外接屏 DDC/CI + 笔记本内置屏 WMI）。
 
-基于 ``dxva2.dll``（回退 ``gdi32.dll``）通过 VCP 通道读写物理显示器
-的亮度与电源状态，并用注册表里的 EDID 解析出显示器真实型号。
+外接屏基于 ``dxva2.dll``（回退 ``gdi32.dll``）通过 VCP 通道读写物理
+显示器的亮度与电源状态，并用注册表里的 EDID 解析出显示器真实型号；
+笔记本内置屏走 ``wmi_brightness`` 模块。
 
 主要出口：
-    * ``enumerate_monitors()`` —— 枚举支持亮度控制的显示器；
+    * ``enumerate_monitors()`` —— 枚举支持亮度控制的显示器（两种来源）；
     * ``get_brightness()`` / ``set_brightness()`` —— 读写亮度；
-    * ``set_all_power()`` —— 批量下发 VCP 0xD6 电源指令；
+    * ``set_all_power()`` —— 批量下发 VCP 0xD6 电源指令（仅 DDC）；
     * ``*_async()`` —— 上述操作的线程包装，供 GUI 线程调用。
 
 注意：``MonitorInfo`` 里持有 ``DestroyPhysicalMonitor`` 才能释放的句柄，
-用完必须交给 ``cleanup()``。
+用完必须交给 ``cleanup()``；WMI 来源的条目没有句柄，``destroy()`` 会跳过。
 """
 
 import ctypes
@@ -19,6 +20,8 @@ import threading
 import time
 import winreg
 from ctypes import wintypes, Structure, POINTER, byref
+
+from plugins.brightness_controller import wmi_brightness
 
 
 PHYSICAL_MONITOR_DESCRIPTION_SIZE = 128
@@ -68,26 +71,32 @@ class MonitorInfo:
     """封装单个显示器的句柄、名称和亮度范围。
 
     属性：
-        hmonitor: ``HMONITOR``，用于和鼠标所在显示器做匹配。
+        hmonitor: ``HMONITOR``，用于和鼠标所在显示器做匹配。WMI 内置屏
+            映射不到具体显示器时为 0。
         handle: ``GetPhysicalMonitorsFromHMONITOR`` 返回的物理显示器句柄，
-            必须由 ``_DestroyPhysicalMonitor`` 释放。
-        name: DDC 返回的描述名，通常是 "Generic PnP Monitor"。
-        device: 设备名，如 ``\\\\.\\DISPLAY1``。
+            必须由 ``_DestroyPhysicalMonitor`` 释放；WMI 来源为 ``None``。
+        name: DDC 返回的描述名（通常是 "Generic PnP Monitor"），或
+            "内置显示器 (WMI)"。
+        device: 设备名，如 ``\\\\.\\DISPLAY1``；WMI 映射失败时为空串。
         friendly: 从 EDID 解析出的真实型号，取不到时为空串。
+        source: ``"ddc"`` 或 ``"wmi"``，决定读写走哪条通道。
+        instance: WMI 的 ``InstanceName``，DDC 来源为空串。
     """
 
     __slots__ = (
-        "hmonitor", "handle", "name", "device", "friendly",
-        "_min", "_max", "_current",
+        "hmonitor", "handle", "name", "device", "friendly", "source",
+        "instance", "_min", "_max", "_current",
     )
 
     def __init__(self, hmonitor, handle, name, min_v, max_v, current,
-                 device="", friendly=""):
-        self.hmonitor = hmonitor     # HMONITOR 句柄
-        self.handle = handle         # 物理显示器句柄
+                 device="", friendly="", source="ddc", instance=""):
+        self.hmonitor = hmonitor     # HMONITOR 句柄；WMI 未映射时为 0
+        self.handle = handle         # 物理显示器句柄；WMI 来源为 None
         self.name = name.strip("\x00").strip()  # DDC 返回的名称，常为 Generic PnP Monitor
         self.device = device.strip("\x00").strip()  # 设备名，如 \\.\DISPLAY1
         self.friendly = friendly.strip()  # EDID 中的真实型号，如 LG ULTRAWIDE
+        self.source = source         # "ddc" | "wmi"
+        self.instance = instance     # WMI InstanceName
         self._min = min_v
         self._max = max_v
         self._current = current
@@ -301,6 +310,131 @@ def get_friendly_name(device_name):
         return ""
 
 
+def _enumerate_display_devices():
+    r"""返回 ``[(GDI 设备名, 显示器 PnP ID)]``。
+
+    用于把 WMI 的 ``DISPLAY\LGD05E5\...`` 实例映射回 ``\\.\DISPLAY1``，
+    进而拿到 ``HMONITOR``。
+    """
+    result = []
+    adapter = DISPLAY_DEVICEW()
+    adapter.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+    index = 0
+    while _EnumDisplayDevicesW(None, index, byref(adapter), 0):
+        device_name = adapter.DeviceName.strip("\x00").strip()
+        if device_name:
+            monitor = DISPLAY_DEVICEW()
+            monitor.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+            sub = 0
+            while _EnumDisplayDevicesW(device_name, sub, byref(monitor), 0):
+                parts = monitor.DeviceID.strip("\x00").strip().split("\\")
+                if len(parts) >= 2 and parts[1]:
+                    result.append((device_name, parts[1]))
+                monitor = DISPLAY_DEVICEW()
+                monitor.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+                sub += 1
+        adapter = DISPLAY_DEVICEW()
+        adapter.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+        index += 1
+    return result
+
+
+def _wmi_monitor_info(entry, hmonitor, device):
+    """把一条 WMI 记录包装成 ``MonitorInfo``。"""
+    pnp_id = entry.pnp_id or ""
+    friendly = _edid_friendly_name(pnp_id) if pnp_id else ""
+    return MonitorInfo(
+        hmonitor,
+        None,
+        "内置显示器 (WMI)",
+        0,
+        100,
+        entry.current,
+        device,
+        friendly,
+        source="wmi",
+        instance=entry.instance,
+    )
+
+
+def _merge_wmi_monitors(ddc_monitors, unsupported, hmon_by_device,
+                        wmi_entries, display_devices=None):
+    """把 WMI 内置屏合并进 DDC 枚举结果，返回新增的条目。
+
+    Args:
+        ddc_monitors: 已经能通过 DDC 读到亮度的显示器。
+        unsupported: ``[(HMONITOR, device)]``，拿不到 DDC 亮度的显示器。
+        hmon_by_device: ``{GDI 设备名: HMONITOR}``。
+        wmi_entries: ``wmi_brightness.WmiMonitor`` 列表。
+        display_devices: ``[(GDI 设备名, PnP ID)]``，默认自动枚举。
+
+    Returns:
+        新增的 WMI ``MonitorInfo`` 列表。同一块屏如果 DDC 已经可用，
+        则保留 DDC（还能软关屏），跳过对应的 WMI 条目。
+    """
+    if not wmi_entries:
+        return []
+
+    if display_devices is None:
+        try:
+            display_devices = _enumerate_display_devices()
+        except Exception:
+            display_devices = []
+
+    ddc_devices = {m.device for m in ddc_monitors if m.device}
+    ddc_hmonitors = {m.hmonitor for m in ddc_monitors if m.hmonitor}
+    ddc_pnp = set()
+    for monitor in ddc_monitors:
+        pnp = _pnp_id_from_device(monitor.device).upper()
+        if pnp:
+            ddc_pnp.add(pnp)
+
+    added = []
+    used_hmonitors = set()
+    unmapped = []
+
+    for entry in wmi_entries:
+        pnp = (entry.pnp_id or "").upper()
+        if pnp and pnp in ddc_pnp:
+            continue
+
+        hmonitor = 0
+        device = ""
+        for gdi_device, gdi_pnp in display_devices:
+            if pnp and gdi_pnp.upper() == pnp:
+                device = gdi_device
+                hmonitor = hmon_by_device.get(gdi_device, 0)
+                break
+
+        if hmonitor and (hmonitor in ddc_hmonitors or device in ddc_devices):
+            continue
+
+        if hmonitor:
+            used_hmonitors.add(hmonitor)
+            added.append(_wmi_monitor_info(entry, hmonitor, device))
+        else:
+            unmapped.append(entry)
+
+    # 兜底映射：WMI 恰好一条，且恰好剩一个显示器 DDC 读不到亮度，
+    # 那基本可以确定这块就是内置屏（PnP 对不上时也能用）。
+    candidates = [
+        (hmonitor, device) for hmonitor, device in unsupported
+        if hmonitor not in used_hmonitors
+    ]
+    if len(unmapped) == 1 and len(candidates) == 1:
+        hmonitor, device = candidates[0]
+        used_hmonitors.add(hmonitor)
+        added.append(_wmi_monitor_info(unmapped[0], hmonitor, device))
+        unmapped = []
+
+    # 仍映射不到 HMONITOR 的条目也保留：浮窗里可以手动选，
+    # 热键会按"唯一未映射内置屏"兜底。
+    for entry in unmapped:
+        added.append(_wmi_monitor_info(entry, 0, ""))
+
+    return added
+
+
 def _get_monitor_handles():
     """获取所有显示器的 HMONITOR 句柄列表"""
     _thread_local.enum_list = []
@@ -310,15 +444,11 @@ def _get_monitor_handles():
 
 
 def enumerate_monitors():
-    """遍历所有显示器，返回支持 DDC/CI 亮度控制的条目。
+    """遍历所有显示器，返回支持亮度控制的条目（DDC + WMI 内置屏）。
 
     Returns:
-        ``MonitorInfo`` 列表。每个元素都持有需要 ``cleanup()`` 释放的
-        物理显示器句柄。枚举失败时返回空列表。
-
-    Note:
-        ``_GetMonitorBrightness`` 失败的分支没有调用
-        ``_DestroyPhysicalMonitor``，句柄会泄漏（审计报告 P1-7）。
+        ``MonitorInfo`` 列表。DDC 条目持有需要 ``cleanup()`` 释放的
+        物理显示器句柄，WMI 条目没有句柄。枚举失败时返回空列表。
     """
     try:
         hmonitors = _get_monitor_handles()
@@ -326,26 +456,37 @@ def enumerate_monitors():
         return []
 
     result = []
+    unsupported = []
+    hmon_by_device = {}
+
     for hmon in hmonitors:
+        device = get_device_name(hmon)
+        if device:
+            hmon_by_device[device] = hmon
+
         count = wintypes.DWORD(0)
-        if not _GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, byref(count)):
-            continue
-        if count.value == 0:
+        if (not _GetNumberOfPhysicalMonitorsFromHMONITOR(
+                hmon, byref(count)) or count.value == 0):
+            # 笔记本内置 eDP 屏通常走到这里：没有 DDC 物理显示器
+            unsupported.append((hmon, device))
             continue
 
         arr = (PHYSICAL_MONITOR * count.value)()
         if not _GetPhysicalMonitorsFromHMONITOR(hmon, count.value, arr):
+            unsupported.append((hmon, device))
             continue
 
-        device = get_device_name(hmon)
         friendly = get_friendly_name(device)
+        found = False
         for i in range(count.value):
             pm = arr[i]
             min_v = wintypes.DWORD(0)
             cur_v = wintypes.DWORD(0)
             max_v = wintypes.DWORD(0)
 
-            if _GetMonitorBrightness(pm.hPhysicalMonitor, byref(min_v), byref(cur_v), byref(max_v)):
+            if _GetMonitorBrightness(
+                    pm.hPhysicalMonitor, byref(min_v), byref(cur_v),
+                    byref(max_v)):
                 result.append(MonitorInfo(
                     hmon,
                     pm.hPhysicalMonitor,
@@ -356,11 +497,33 @@ def enumerate_monitors():
                     device,
                     friendly,
                 ))
+                found = True
+            else:
+                # 读不到亮度就不会再用这个句柄，必须释放，否则泄漏
+                _DestroyPhysicalMonitor(pm.hPhysicalMonitor)
+
+        if not found:
+            unsupported.append((hmon, device))
+
+    try:
+        wmi_entries = wmi_brightness.enumerate_monitors()
+    except Exception:
+        wmi_entries = []
+    if wmi_entries:
+        result.extend(_merge_wmi_monitors(
+            result, unsupported, hmon_by_device, wmi_entries))
+
     return result
 
 
 def get_brightness(monitor):
     """读取指定显示器的当前亮度值"""
+    if monitor.source == "wmi":
+        value = wmi_brightness.get_brightness(monitor.instance)
+        if value is not None:
+            monitor._current = value
+        return monitor._current
+
     min_v = wintypes.DWORD(0)
     cur_v = wintypes.DWORD(0)
     max_v = wintypes.DWORD(0)
@@ -373,6 +536,10 @@ def get_brightness(monitor):
 def set_brightness(monitor, value):
     """设置指定显示器的亮度值（自动限制在有效范围内）"""
     v = max(monitor._min, min(monitor._max, value))
+    if monitor.source == "wmi":
+        if wmi_brightness.set_brightness(monitor.instance, v):
+            monitor._current = v
+        return
     if _SetMonitorBrightness(monitor.handle, v):
         monitor._current = v
 
@@ -421,7 +588,9 @@ def set_all_power(mode, retries=3):
 
 
 def destroy(monitor):
-    """释放单个物理显示器句柄"""
+    """释放单个物理显示器句柄（WMI 条目没有句柄，直接跳过）"""
+    if monitor.handle is None:
+        return
     try:
         _DestroyPhysicalMonitor(monitor.handle)
     except Exception:
@@ -446,8 +615,14 @@ def enumerate_monitors_async(callback):
 def set_brightness_async(monitor, value):
     """在后台线程设置显示器亮度。
 
+    WMI 内置屏交给常驻工作线程串行写入；DDC 仍然每次新起线程。
+
     Note:
-        每次调用都新起线程且没有串行化，连续调用时多个线程可能并发进入
-        DDC 通道，导致最终亮度与最后一次请求不一致（审计报告 P1-10）。
+        DDC 分支每次调用都新起线程且没有串行化，连续调用时多个线程
+        可能并发进入 DDC 通道，导致最终亮度与最后一次请求不一致
+        （审计报告 P1-10）。
     """
+    if monitor.source == "wmi":
+        wmi_brightness.set_brightness_async(monitor.instance, value)
+        return
     threading.Thread(target=set_brightness, args=(monitor, value), daemon=True).start()

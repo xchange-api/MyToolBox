@@ -117,6 +117,22 @@ def get_accent_color():
     return "#0078d4"
 
 
+def _targets_for_monitor(monitors, target):
+    """按 HMONITOR 找目标显示器。
+
+    WMI 内置屏可能映射不到具体 HMONITOR（hmonitor=0）；只有它是唯一
+    未映射条目时才兜底命中，避免误调到别的屏。
+    """
+    matches = [m for m in monitors if m.hmonitor == target]
+    if matches:
+        return matches
+    unmapped = [
+        m for m in monitors
+        if not m.hmonitor and m.source == "wmi"
+    ]
+    return unmapped if len(unmapped) == 1 else []
+
+
 def _make_sun_pixmap(size=20):
     """画一个太阳图标，用于图标文件缺失时兜底。
 
@@ -430,11 +446,8 @@ class BrightnessFlyout(QWidget):
             return
 
         self._titles = self._monitor_titles()
-        self._selected = next(
-            (m for m in self._monitors
-             if m.hmonitor == self._show_target),
-            self._monitors[0],
-        )
+        targets = _targets_for_monitor(self._monitors, self._show_target)
+        self._selected = targets[0] if targets else self._monitors[0]
         self._build_ui(activate=hotkey_delta is None)
         if hotkey_delta is not None:
             self._adjust_brightness(hotkey_delta)
@@ -587,7 +600,12 @@ class BrightnessFlyout(QWidget):
         for monitor, title in zip(self._monitors, self._titles):
             row = ClickableRow(inner)
             row.setFixedHeight(LIST_ITEM_H)
-            row.setToolTip(f"{title}\n{monitor.name} · {monitor.device}".strip())
+            detail = " · ".join(
+                part for part in (
+                    monitor.friendly, monitor.name, monitor.device)
+                if part
+            )
+            row.setToolTip(f"{title}\n{detail}".strip())
 
             layout = QHBoxLayout(row)
             layout.setContentsMargins(15, 0, 15, 0)
@@ -805,7 +823,7 @@ class BrightnessFlyout(QWidget):
         # 在按键当下取一次 HMONITOR，避免异步枚举期间鼠标移动改变目标。
         target = cursor_monitor()
         if self._monitors:
-            targets = [m for m in self._monitors if m.hmonitor == target]
+            targets = _targets_for_monitor(self._monitors, target)
             if targets:
                 self._focus_monitor(targets[0])
                 self._do_adjust(targets, delta)
@@ -824,7 +842,7 @@ class BrightnessFlyout(QWidget):
             target: 按键当下记录的 ``HMONITOR``。
             delta: 亮度增量。
         """
-        targets = [m for m in monitors if m.hmonitor == target]
+        targets = _targets_for_monitor(monitors, target)
         if not targets:
             cleanup(monitors)
             return
@@ -955,7 +973,13 @@ class BrightnessFlyout(QWidget):
     # ---- 清理 ----
 
     def _monitor_label(self, monitor, index):
-        """优先用 EDID 型号名，取不到时退回 Windows 的显示器编号"""
+        """优先用 EDID 型号名，取不到时退回显示器编号。
+
+        WMI 内置屏统一叫“内置显示器”：内置 EDID 的型号名通常是
+        ``LP140QH2-SPB1`` 这类面板料号，对用户没有意义。
+        """
+        if monitor.source == "wmi":
+            return "内置显示器"
         if monitor.friendly:
             return monitor.friendly
         match = re.search(r"DISPLAY(\d+)$", monitor.device)
