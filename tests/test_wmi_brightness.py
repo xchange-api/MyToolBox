@@ -6,6 +6,7 @@
 
 import os
 import sys
+import threading
 import time
 import unittest
 
@@ -27,35 +28,119 @@ class FakeBrightnessRow:
         self.CurrentBrightness = current
 
 
+class FakeParamItem:
+    """假的 SWbemProperty，``Value`` 可读可写。"""
+
+    def __init__(self, values, name):
+        self._values = values
+        self._name = name
+
+    @property
+    def Value(self):
+        return self._values[self._name]
+
+    @Value.setter
+    def Value(self, value):
+        self._values[self._name] = value
+
+
+class FakeParams:
+    """假的入参/出参对象，模拟 ``Properties_.Item(name).Value``。"""
+
+    def __init__(self):
+        self._values = {}
+        self.Properties_ = self
+
+    def Item(self, name):
+        return FakeParamItem(self._values, name)
+
+    def SpawnInstance_(self):
+        return FakeParams()
+
+
+class FakeMethod:
+    """假的 SWbemMethod，只暴露 ``InParameters``。"""
+
+    def __init__(self):
+        self.InParameters = FakeParams()
+
+
+class FakeClass:
+    """假的类定义，``Methods_("WmiSetBrightness")`` 返回入参模板。"""
+
+    def Methods_(self, name):
+        if name != "WmiSetBrightness":
+            raise AttributeError(name)
+        return FakeMethod()
+
+
+class FakePath:
+    """假的 ``Path_``，带一个能唯一定位实例的路径。"""
+
+    def __init__(self, instance):
+        self.Path = (
+            "\\\\HOST\\root\\wmi:WmiMonitorBrightnessMethods"
+            f'.InstanceName="{instance}"'
+        )
+
+
 class FakeMethodRow:
     """假的 WmiMonitorBrightnessMethods 记录。"""
 
-    def __init__(self, instance, sink):
+    def __init__(self, instance):
         self.InstanceName = instance
-        self._sink = sink
-
-    def WmiSetBrightness(self, timeout, value):
-        """记录写入参数，返回 0 表示成功。"""
-        self._sink.append((self.InstanceName, timeout, value))
-        return 0
+        self.Active = True
+        self.Path_ = FakePath(instance)
 
 
 class FakeService:
-    """假的 root\\wmi 服务对象。"""
+    """假的 root\\wmi 服务对象，按 ``ExecMethod`` 标准流程记录写入。"""
 
     def __init__(self, instances, sink):
         self.instances = instances
         self.sink = sink
         self.current = {name: 50 for name in instances}
+        self.return_code = 0
+        self.rows = [FakeMethodRow(name) for name in instances]
 
     def ExecQuery(self, query):
         """按查询字符串返回对应的假记录。"""
         if "WmiMonitorBrightnessMethods" in query:
-            return [FakeMethodRow(name, self.sink) for name in self.instances]
+            return list(self.rows)
         if "WmiMonitorBrightness" in query:
             return [FakeBrightnessRow(name, self.current[name])
                     for name in self.instances]
         return []
+
+    def Get(self, class_name):
+        """返回假的类定义。"""
+        if class_name != "WmiMonitorBrightnessMethods":
+            raise AttributeError(class_name)
+        return FakeClass()
+
+    def ExecMethod(self, path, method_name, in_params):
+        """记录 ``WmiSetBrightness`` 的入参，返回配置好的返回码。"""
+        if method_name != "WmiSetBrightness":
+            raise AttributeError(method_name)
+        for row in self.rows:
+            if row.Path_.Path != path:
+                continue
+            timeout = in_params.Properties_.Item("Timeout").Value
+            value = in_params.Properties_.Item("Brightness").Value
+            self.sink.append((row.InstanceName, timeout, value))
+            return FakeOutParams(self.return_code)
+        raise RuntimeError(f"未知实例路径: {path}")
+
+
+class FakeOutParams:
+    """假的出参对象，只提供 ``ReturnValue``。"""
+
+    def __init__(self, return_code):
+        self._values = {"ReturnValue": return_code}
+        self.Properties_ = self
+
+    def Item(self, name):
+        return FakeParamItem(self._values, name)
 
 
 class WmiWorkerTest(unittest.TestCase):
@@ -66,12 +151,15 @@ class WmiWorkerTest(unittest.TestCase):
         self.sink = []
         self.service = FakeService([INSTANCE], self.sink)
         self._original = wmi_brightness._worker
+        self._disabled = wmi_brightness._logger.disabled
+        wmi_brightness._logger.disabled = True
         wmi_brightness._worker = wmi_brightness._WmiWorker(
             service_factory=lambda: self.service)
 
     def tearDown(self):
-        """恢复真实 worker。"""
+        """恢复真实 worker 与日志状态。"""
         wmi_brightness._worker = self._original
+        wmi_brightness._logger.disabled = self._disabled
 
     def test_enumerate_parses_pnp_id(self):
         """枚举结果应带 InstanceName 和解析出的 PnP ID。"""
@@ -87,21 +175,44 @@ class WmiWorkerTest(unittest.TestCase):
         self.assertIsNone(wmi_brightness.get_brightness("DISPLAY\\X\\0"))
 
     def test_set_brightness_clamps_value(self):
-        """写入值应被夹在 0~100，并使用 Timeout=0。"""
+        """写入值应被夹在 0~100，并走 ExecMethod 且 Timeout=1。"""
         self.assertTrue(wmi_brightness.set_brightness(INSTANCE, 250))
-        self.assertEqual(self.sink[-1], (INSTANCE, 0, 100))
+        self.assertEqual(self.sink[-1], (INSTANCE, 1, 100))
         self.assertTrue(wmi_brightness.set_brightness(INSTANCE, -5))
-        self.assertEqual(self.sink[-1], (INSTANCE, 0, 0))
+        self.assertEqual(self.sink[-1], (INSTANCE, 1, 0))
 
-    def test_async_writes_keep_order(self):
-        """连续异步写入应按入队顺序落地。"""
-        for value in (10, 20, 30, 40):
-            wmi_brightness.set_brightness_async(INSTANCE, value)
+    def test_nonzero_return_code_is_failure(self):
+        """ExecMethod 返回非 0 时应视为失败。"""
+        self.service.return_code = 0x80041008
+        self.assertFalse(wmi_brightness.set_brightness(INSTANCE, 60))
+
+    def test_inactive_instance_still_written(self):
+        """实例不是 Active 时仍尝试写入，避免个别机型完全无法调节。"""
+        self.service.rows[0].Active = False
+        self.assertTrue(wmi_brightness.set_brightness(INSTANCE, 60))
+        self.assertEqual(self.sink[-1], (INSTANCE, 1, 60))
+
+    def test_async_writes_keep_latest(self):
+        """连续异步写入只保留最新值，中间值不会逐条写给驱动。"""
+        gate = threading.Event()
+        started = threading.Event()
+
+        def _block(service):
+            started.set()
+            gate.wait(2)
+
+        wmi_brightness._worker.submit(_block)
+        self.assertTrue(started.wait(2))
+        try:
+            for value in (10, 20, 30, 40):
+                wmi_brightness.set_brightness_async(INSTANCE, value)
+        finally:
+            gate.set()
 
         deadline = time.time() + 3
-        while len(self.sink) < 4 and time.time() < deadline:
+        while not self.sink and time.time() < deadline:
             time.sleep(0.01)
-        self.assertEqual([item[2] for item in self.sink], [10, 20, 30, 40])
+        self.assertEqual([item[2] for item in self.sink], [40])
 
     def test_unknown_instance_is_not_written(self):
         """找不到实例时写入应失败且不产生记录。"""
