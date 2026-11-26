@@ -404,5 +404,35 @@ class TargetTest(unittest.TestCase):
             flyout._targets_for_monitor([self.internal, second], 222), [])
 
 
+class LabelTest(unittest.TestCase):
+    """浮窗标题选择：优先显示显示器自己的名称。"""
+
+    @staticmethod
+    def _label(monitor, index=0):
+        """不构造窗口，直接调用取标题的纯函数部分。"""
+        return flyout.BrightnessFlyout._monitor_label(None, monitor, index)
+
+    def test_wmi_uses_edid_name(self):
+        """内置屏有 EDID 型号时显示型号，而不是固定的“内置显示器”。"""
+        monitor = MonitorInfo(
+            0, None, "内置显示器 (WMI)", 0, 100, 45, "",
+            "LP140QH2", source="wmi", instance=INSTANCE)
+        self.assertEqual(self._label(monitor), "LP140QH2")
+
+    def test_wmi_falls_back_without_edid(self):
+        """读不到 EDID 时才退回“内置显示器”。"""
+        monitor = MonitorInfo(
+            0, None, "内置显示器 (WMI)", 0, 100, 45, "",
+            source="wmi", instance=INSTANCE)
+        self.assertEqual(self._label(monitor), "内置显示器")
+
+    def test_external_uses_edid_name(self):
+        """外接屏行为不变，仍然显示 EDID 型号。"""
+        monitor = MonitorInfo(
+            111, 1234, "Generic PnP Monitor", 0, 100, 50,
+            r"\\.\DISPLAY1", "LG ULTRAWIDE")
+        self.assertEqual(self._label(monitor), "LG ULTRAWIDE")
+
+
 if __name__ == "__main__":
     unittest.main()

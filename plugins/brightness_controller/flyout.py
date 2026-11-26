@@ -975,13 +975,13 @@ class BrightnessFlyout(QWidget):
     def _monitor_label(self, monitor, index):
         """优先用 EDID 型号名，取不到时退回显示器编号。
 
-        WMI 内置屏统一叫“内置显示器”：内置 EDID 的型号名通常是
-        ``LP140QH2-SPB1`` 这类面板料号，对用户没有意义。
+        WMI 内置屏的 EDID 型号通常是 ``LP140QH2`` 这类面板料号，有就照用；
+        读不到 EDID 时才退回“内置显示器”。
         """
-        if monitor.source == "wmi":
-            return "内置显示器"
         if monitor.friendly:
             return monitor.friendly
+        if monitor.source == "wmi":
+            return "内置显示器"
         match = re.search(r"DISPLAY(\d+)$", monitor.device)
         if match:
             return f"显示器 {match.group(1)}"
