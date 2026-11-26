@@ -27,7 +27,6 @@ from plugins.brightness_controller import wmi_brightness
 PHYSICAL_MONITOR_DESCRIPTION_SIZE = 128
 
 VCP_POWER_MODE = 0xD6
-POWER_ON = 1
 POWER_OFF = 4
 
 

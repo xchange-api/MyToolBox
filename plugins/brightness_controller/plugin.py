@@ -13,7 +13,6 @@ import ctypes
 import os
 import sys
 import threading
-import time
 from ctypes import wintypes
 
 from PySide6.QtGui import QIcon
@@ -69,16 +68,9 @@ class BrightnessPlugin(Plugin):
         self._icon_path = _get_icon_path()
 
     def on_start(self):
-        """创建浮窗与独立托盘图标，注册热键，按需安装关机关屏钩子。
-
-        若配置启用了 ``power_off_on_shutdown``，先异步给所有显示器发送
-        点亮指令——显示器被 VCP 深度关闭后不会因视频信号自动唤醒。
-        """
+        """创建浮窗与独立托盘图标，注册热键，按需安装关机关屏钩子。"""
         from plugins.brightness_controller.flyout import BrightnessFlyout
 
-        enabled = bool(self._config.get("power_off_on_shutdown", False))
-        if enabled:
-            self._wake_screen()
         self._flyout = BrightnessFlyout(self.app, self._icon_path)
 
         icon = QIcon(self._icon_path)
@@ -114,23 +106,6 @@ class BrightnessPlugin(Plugin):
         """托盘图标被左键单击时弹出浮窗。"""
         if reason == QSystemTrayIcon.ActivationReason.Trigger and self._flyout:
             self.app.schedule_ui(self._flyout.show)
-
-    def _wake_screen(self):
-        """启动时点亮显示器：深度软关（0xD6=4）跨断电保存，重启时的视频信号
-        唤不醒显示器，必须由 DDC 指令恢复，否则开机后一直黑屏。"""
-        def _worker():
-            from plugins.brightness_controller import ddcci
-            for attempt in range(4):
-                try:
-                    ok, total = ddcci.set_all_power(ddcci.POWER_ON)
-                    if total and ok == total:
-                        self._log.info(f"启动点亮显示器: {ok}/{total} 台成功")
-                        return
-                    self._log.warning(f"启动点亮显示器失败: {ok}/{total} (第 {attempt + 1}/4 次)")
-                except Exception as e:
-                    self._log.warning(f"启动点亮显示器异常: {e}")
-                time.sleep(1.5)
-        threading.Thread(target=_worker, daemon=True).start()
 
     def _start_shutdown_hook(self):
         """在隐藏窗口上安装 WndProc 子类，拦截系统关机事件。"""
